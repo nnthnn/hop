@@ -1,4 +1,4 @@
-# xwitch
+# hop
 
 A configurable X11 Alt+Tab window switcher written in Rust, with ARGB transparency and compositor blur support.
 
@@ -14,16 +14,16 @@ A configurable X11 Alt+Tab window switcher written in Rust, with ARGB transparen
 ## Building
 
 ```fish
-cd ~/source/xwitch
+cd ~/source/hop
 cargo build --release
 ```
 
-The binary ends up at `target/release/xwitch`.
+The binary ends up at `target/release/hop`.
 
 ## Installing
 
 ```fish
-cp target/release/xwitch ~/.local/bin/xwitch
+cp target/release/hop ~/.local/bin/hop
 ```
 
 ## Configuration
@@ -31,11 +31,11 @@ cp target/release/xwitch ~/.local/bin/xwitch
 Copy the example config and edit it:
 
 ```fish
-mkdir -p ~/.config/xwitch
-cp config.example.toml ~/.config/xwitch/config.toml
+mkdir -p ~/.config/hop
+cp config.example.toml ~/.config/hop/config.toml
 ```
 
-Config is read from `$XDG_CONFIG_HOME/xwitch/config.toml` (defaults to `~/.config/xwitch/config.toml`). If no config is found, built-in Dracula-themed defaults are used.
+Config is read from `$XDG_CONFIG_HOME/hop/config.toml` (defaults to `~/.config/hop/config.toml`). If no config is found, built-in Dracula-themed defaults are used.
 
 ### Options
 
@@ -74,13 +74,13 @@ cancel   = "Escape"
 
 ## Autostart (XFCE)
 
-Create `~/.config/autostart/xwitch.desktop`:
+Create `~/.config/autostart/hop.desktop`:
 
 ```ini
 [Desktop Entry]
 Type=Application
-Name=xwitch
-Exec=/home/<user>/.local/bin/xwitch
+Name=hop
+Exec=/home/<user>/.local/bin/hop
 Hidden=false
 X-XFCE-Autostart-Override=true
 ```

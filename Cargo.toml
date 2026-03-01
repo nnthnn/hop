@@ -1,5 +1,5 @@
 [package]
-name = "xwitch"
+name = "hop"
 version = "0.1.0"
 edition = "2021"
 description = "A configurable X11 Alt+Tab window switcher with ARGB transparency"

@@ -139,7 +139,7 @@ impl<'a> Switcher<'a> {
         xh::set_skip_taskbar(self.conn, win)?;
 
         // Set WM_CLASS so picom rules can match it
-        let class_str = b"xwitch\0xwitch\0";
+        let class_str = b"hop\0hop\0";
         let wm_class = xh::intern_atom(self.conn, "WM_CLASS")?;
         self.conn.change_property8(PropMode::REPLACE, win, wm_class, AtomEnum::STRING, class_str)?
             .check()?;
@@ -179,7 +179,7 @@ impl<'a> Switcher<'a> {
             .map(|f| f.id);
 
         let Some(fmt) = argb_fmt else {
-            eprintln!("xwitch: no ARGB32 render format found");
+            eprintln!("hop: no ARGB32 render format found");
             return Ok(());
         };
 

@@ -1,5 +1,5 @@
-# xwitch configuration
-# Copy to ~/.config/xwitch/config.toml
+# hop configuration
+# Copy to ~/.config/hop/config.toml
 
 [window]
 tile_width   = 200

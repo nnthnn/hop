@@ -128,10 +128,10 @@ impl Config {
     pub fn load() -> Result<Self, Box<dyn Error>> {
         if let Some(path) = Self::config_path() {
             let content = std::fs::read_to_string(&path)?;
-            eprintln!("xwitch: loaded config from {}", path.display());
+            eprintln!("hop: loaded config from {}", path.display());
             Ok(toml::from_str(&content)?)
         } else {
-            eprintln!("xwitch: no config found, using defaults");
+            eprintln!("hop: no config found, using defaults");
             Ok(Config::default())
         }
     }
@@ -143,7 +143,7 @@ impl Config {
                 let home = std::env::var("HOME").unwrap_or_default();
                 std::path::PathBuf::from(home).join(".config")
             });
-        let path = base.join("xwitch").join("config.toml");
+        let path = base.join("hop").join("config.toml");
         path.exists().then_some(path)
     }
 

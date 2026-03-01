@@ -21,15 +21,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let display = Display::connect()?;
 
     if display.argb_visual.is_some() {
-        eprintln!("xwitch: 32-bit ARGB visual available, transparency enabled");
+        eprintln!("hop: 32-bit ARGB visual available, transparency enabled");
     } else {
-        eprintln!("xwitch: no ARGB visual, transparency disabled");
+        eprintln!("hop: no ARGB visual, transparency disabled");
     }
 
     x11::grab_keys(&display.conn, display.root)?;
     display.conn.flush()?;
 
-    eprintln!("xwitch: listening for Alt+Tab...");
+    eprintln!("hop: listening for Alt+Tab...");
 
     let mut switcher = Switcher::new(&display.conn, &config, &display)?;
     let root = display.root;
