@@ -7,7 +7,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt,
     Color as RenderColor,
-    PictOp, PictType, CreatePictureAux,
+    PictOp, PictType, CreatePictureAux, Transform,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -215,8 +215,8 @@ impl<'a> Switcher<'a> {
                 ],
             )?.check()?;
 
-            // Icon (placeholder — full icon rendering via XRender to be added)
-            self.draw_icon_placeholder(win_pic, fmt, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            // Icon
+            self.draw_icon(win_pic, fmt, win, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
 
         self.conn.render_free_picture(win_pic)?.check()?;
@@ -224,10 +224,11 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
-    fn draw_icon_placeholder(
+    fn draw_icon(
         &self,
         win_pic: u32,
         fmt: u32,
+        drawable: Window,
         entry: &WindowEntry,
         tile_x: i16,
         tile_y: i16,
@@ -239,19 +240,75 @@ impl<'a> Switcher<'a> {
         let icon_x = tile_x + ((tile_w - icon_size) / 2) as i16;
         let icon_y = tile_y + ((tile_h - icon_size) / 2) as i16;
 
-        // TODO: render actual icon pixmap from entry.icon
-        // For now, draw a simple rectangle placeholder
-        let (fr, fg_c, fb, fa) = argb_to_render_color(fg_argb);
-        self.conn.render_fill_rectangles(
+        let (src_w, src_h, pixels) = match &entry.icon {
+            Some(icon) => icon,
+            None => {
+                // No icon data — draw a dim placeholder rectangle
+                let (fr, fg_c, fb, fa) = argb_to_render_color(fg_argb);
+                self.conn.render_fill_rectangles(
+                    PictOp::OVER,
+                    win_pic,
+                    RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
+                    &[Rectangle {
+                        x: icon_x, y: icon_y,
+                        width: icon_size as u16, height: icon_size as u16,
+                    }],
+                )?.check()?;
+                return Ok(());
+            }
+        };
+        let (src_w, src_h) = (*src_w, *src_h);
+
+        // Upload pixels into a 32-bit pixmap
+        let pixmap = self.conn.generate_id()?;
+        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+
+        let gc = self.conn.generate_id()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+
+        // Vec<u32> ARGB pixels → native-endian bytes (matches XRender ARGB32 layout)
+        let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
+        self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            pixmap, gc,
+            src_w as u16, src_h as u16,
+            0i16, 0i16,  // dst_x, dst_y
+            0u8,         // left_pad
+            32u8,        // depth
+            &bytes,
+        )?.check()?;
+        self.conn.free_gc(gc)?.check()?;
+
+        // Create an XRender Picture for the pixmap
+        let icon_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(icon_pic, pixmap, fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.free_pixmap(pixmap)?.check()?;
+
+        // Scale to icon_size if the source dimensions differ
+        if src_w != icon_size || src_h != icon_size {
+            let sx = (src_w as i64 * 65536 / icon_size as i64) as i32;
+            let sy = (src_h as i64 * 65536 / icon_size as i64) as i32;
+            self.conn.render_set_picture_transform(icon_pic, Transform {
+                matrix11: sx, matrix12: 0, matrix13: 0,
+                matrix21: 0, matrix22: sy, matrix23: 0,
+                matrix31: 0, matrix32: 0, matrix33: 65536,
+            })?.check()?;
+            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?.check()?;
+        }
+
+        // Composite icon OVER the tile
+        self.conn.render_composite(
             PictOp::OVER,
+            icon_pic,
+            0u32,        // mask = None
             win_pic,
-            RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
-            &[Rectangle {
-                x: icon_x, y: icon_y,
-                width: icon_size as u16, height: icon_size as u16,
-            }],
+            0, 0,        // src_x, src_y
+            0, 0,        // mask_x, mask_y
+            icon_x, icon_y,
+            icon_size as u16, icon_size as u16,
         )?.check()?;
 
+        self.conn.render_free_picture(icon_pic)?.check()?;
         Ok(())
     }
 
