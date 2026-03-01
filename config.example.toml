@@ -1,0 +1,34 @@
+# xwitch configuration
+# Copy to ~/.config/xwitch/config.toml
+
+[window]
+tile_width   = 200
+tile_height  = 150
+icon_size    = 64
+border_width = 4
+position     = "center"   # "center" or "x,y"
+
+[colors]
+background = "#282a36"
+bg_alpha   = 0.80         # 0.0 (transparent) – 1.0 (opaque)
+foreground = "#f8f8f2"
+frame      = "#bd93f9"    # selected tile border
+inactive   = "#44475a"    # unselected tile border
+border     = "#6272a4"    # outer window border
+
+[font]
+name = "Roboto"
+size = 11
+
+[blur]
+enabled = true
+# Hint passed to the compositor via _KDE_NET_WM_BLUR_BEHIND_REGION.
+# Picom must have blur-background = true in its own config for this to work.
+# Set to 0 to disable the blur hint entirely.
+radius = 10
+
+[keys]
+modifier = "Alt"
+next     = "Tab"
+prev     = "Shift+Tab"
+cancel   = "Escape"

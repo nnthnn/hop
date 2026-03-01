@@ -1,0 +1,11 @@
+[package]
+name = "xwitch"
+version = "0.1.0"
+edition = "2021"
+description = "A configurable X11 Alt+Tab window switcher with ARGB transparency"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["all-extensions"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+png = "0.17"
