@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::x11 as xh;
 
 const FRAME_W: u32 = 8;
+const LABEL_H: u32 = 20; // pixels reserved at the bottom of each tile for the title label
 
 pub struct WindowEntry {
     pub id: Window,
@@ -217,6 +218,9 @@ impl<'a> Switcher<'a> {
 
             // Icon
             self.draw_icon(win_pic, fmt, win, entry, tile_x, tile_y, tw, th, fg_argb)?;
+
+            // Title label
+            self.draw_label(win, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
 
         self.conn.render_free_picture(win_pic)?.check()?;
@@ -238,7 +242,8 @@ impl<'a> Switcher<'a> {
     ) -> Result<(), Box<dyn Error>> {
         let icon_size = self.config.window.icon_size;
         let icon_x = tile_x + ((tile_w - icon_size) / 2) as i16;
-        let icon_y = tile_y + ((tile_h - icon_size) / 2) as i16;
+        // Shift icon up by half of LABEL_H so it sits centered in the non-label area
+        let icon_y = tile_y + (tile_h.saturating_sub(icon_size + LABEL_H) / 2) as i16;
 
         let (src_w, src_h, pixels) = match &entry.icon {
             Some(icon) => icon,
@@ -312,6 +317,56 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Render the window title at the bottom of a tile using core X11 text.
+    fn draw_label(
+        &self,
+        win: Window,
+        entry: &WindowEntry,
+        tile_x: i16,
+        tile_y: i16,
+        tile_w: u32,
+        tile_h: u32,
+        fg_argb: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let title = truncate_title(&entry.name, 24);
+        if title.is_empty() {
+            return Ok(());
+        }
+        let title_bytes = title.as_bytes();
+
+        // Try a size-appropriate core font, falling back to "fixed"
+        let font = open_core_font(self.conn, self.config.font.size)?;
+        let Some(font) = font else { return Ok(()); };
+
+        // Measure text width for horizontal centering
+        let chars: Vec<Char2b> = title_bytes.iter()
+            .map(|&b| Char2b { byte1: 0, byte2: b })
+            .collect();
+        let ext = self.conn.query_text_extents(font, &chars)?.reply()?;
+        let text_w = ext.overall_width.max(0) as u32;
+
+        let label_x = tile_x + tile_w.saturating_sub(text_w).wrapping_div(2) as i16;
+        // Baseline near the bottom of the tile
+        let label_y = tile_y + tile_h as i16 - 4;
+
+        let gc = self.conn.generate_id()?;
+        self.conn.create_gc(gc, win, &CreateGCAux::new()
+            .foreground(fg_argb)
+            .background(0)
+            .font(font)
+        )?.check()?;
+
+        // poly_text8 wire format: [delta: u8, count: u8, ...bytes]
+        // Only draws foreground pixels — doesn't overwrite the tile background.
+        let mut items = vec![0u8, title_bytes.len() as u8];
+        items.extend_from_slice(title_bytes);
+        self.conn.poly_text8(win, gc, label_x, label_y, &items)?.check()?;
+
+        self.conn.free_gc(gc)?.check()?;
+        self.conn.close_font(font)?.check()?;
+        Ok(())
+    }
+
     pub fn next(&mut self) -> Result<(), Box<dyn Error>> {
         if self.windows.is_empty() { return Ok(()); }
         self.selected = (self.selected + 1) % self.windows.len();
@@ -354,6 +409,46 @@ impl<'a> Switcher<'a> {
 
     pub fn is_visible(&self) -> bool {
         self.popup.is_some()
+    }
+}
+
+/// Try to open a core X11 font sized for `size` (config pt size).
+/// Falls back to "fixed" which is always available. Returns None only if both fail.
+fn open_core_font(
+    conn: &x11rb::rust_connection::RustConnection,
+    size: u32,
+) -> Result<Option<Font>, Box<dyn Error>> {
+    // Map config point size → closest standard bitmap font name
+    let preferred: &[u8] = match size {
+        0..=9   => b"6x13",
+        10..=11 => b"7x14",
+        12..=13 => b"9x15",
+        14..=15 => b"10x20",
+        _       => b"10x20",
+    };
+
+    let font = conn.generate_id()?;
+    if conn.open_font(font, preferred)?.check().is_ok() {
+        return Ok(Some(font));
+    }
+
+    // Preferred size not available — try "fixed" (always present)
+    let font2 = conn.generate_id()?;
+    if conn.open_font(font2, b"fixed")?.check().is_ok() {
+        return Ok(Some(font2));
+    }
+
+    Ok(None)
+}
+
+/// Truncate a window title to at most `max_chars` characters, appending "..." if needed.
+fn truncate_title(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
 
