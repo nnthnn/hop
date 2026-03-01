@@ -159,6 +159,11 @@ impl<'a> Switcher<'a> {
         self.conn.map_window(win)?.check()?;
         self.conn.flush()?;
 
+        // Grab the entire keyboard so we receive ALL key events while visible —
+        // especially modifier releases (Alt up) which are not covered by grab_key.
+        self.conn.grab_keyboard(false, win, 0u32, GrabMode::ASYNC, GrabMode::ASYNC)?
+            .reply()?;
+
         self.popup = Some(win);
         Ok(())
     }
@@ -514,6 +519,7 @@ impl<'a> Switcher<'a> {
 
     fn hide(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(win) = self.popup.take() {
+            self.conn.ungrab_keyboard(0u32)?.check()?;
             self.conn.destroy_window(win)?.check()?;
             self.conn.flush()?;
         }
