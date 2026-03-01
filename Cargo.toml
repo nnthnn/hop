@@ -6,6 +6,7 @@ description = "A configurable X11 Alt+Tab window switcher with ARGB transparency
 
 [dependencies]
 x11rb = { version = "0.13", features = ["all-extensions"] }
+x11 = { version = "2.21", features = ["xlib", "xft"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 png = "0.17"

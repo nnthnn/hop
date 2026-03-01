@@ -34,6 +34,7 @@ pub struct Switcher<'a> {
     visual_id: Visualid,
     screen_w: u16,
     screen_h: u16,
+    xft: Option<xh::XftState>,
 }
 
 impl<'a> Switcher<'a> {
@@ -50,6 +51,11 @@ impl<'a> Switcher<'a> {
             }
         };
 
+        let xft = xh::XftState::open();
+        if xft.is_none() {
+            eprintln!("hop: Xft unavailable, falling back to bitmap fonts");
+        }
+
         Ok(Switcher {
             conn,
             config,
@@ -60,6 +66,7 @@ impl<'a> Switcher<'a> {
             visual_id,
             screen_w: display.screen_width,
             screen_h: display.screen_height,
+            xft,
         })
     }
 
@@ -317,7 +324,8 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
-    /// Render the window title at the bottom of a tile using core X11 text.
+    /// Render the window title at the bottom of a tile.
+    /// Uses Xft (antialiased, Fontconfig names) when available, bitmap fonts as fallback.
     fn draw_label(
         &self,
         win: Window,
@@ -332,13 +340,116 @@ impl<'a> Switcher<'a> {
         if title.is_empty() {
             return Ok(());
         }
+
+        if let Some(ref xft) = self.xft {
+            self.draw_label_xft(xft, win, &title, tile_x, tile_y, tile_w, tile_h, fg_argb)
+        } else {
+            self.draw_label_bitmap(win, &title, tile_x, tile_y, tile_w, tile_h, fg_argb)
+        }
+    }
+
+    fn draw_label_xft(
+        &self,
+        xst: &xh::XftState,
+        win: Window,
+        title: &str,
+        tile_x: i16,
+        tile_y: i16,
+        tile_w: u32,
+        tile_h: u32,
+        fg_argb: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        use std::ffi::CString;
+        use x11::xft;
+        use x11::xrender::XRenderColor;
+        use x11::xrender::_XGlyphInfo as XGlyphInfo;
+
+        let font_pattern = CString::new(
+            format!("{}:size={}", self.config.font.name, self.config.font.size)
+        )?;
+
+        let font = unsafe {
+            xft::XftFontOpenName(xst.display, xst.screen_num, font_pattern.as_ptr())
+        };
+        // If named font not found, fall back to "sans"
+        let font = if font.is_null() {
+            let fallback = CString::new(format!("sans:size={}", self.config.font.size))?;
+            unsafe { xft::XftFontOpenName(xst.display, xst.screen_num, fallback.as_ptr()) }
+        } else {
+            font
+        };
+        if font.is_null() {
+            return Ok(());
+        }
+
+        let text = title.as_bytes();
+
+        // Measure text for centering
+        let mut extents: XGlyphInfo = unsafe { std::mem::zeroed() };
+        unsafe {
+            xft::XftTextExtentsUtf8(
+                xst.display, font,
+                text.as_ptr(), text.len() as i32,
+                &mut extents,
+            );
+        }
+        let text_w = extents.xOff.max(0) as u32;
+        let label_x = tile_x + tile_w.saturating_sub(text_w).wrapping_div(2) as i16;
+        let label_y = tile_y + tile_h as i16 - 4;
+
+        // Allocate Xft color from fg_argb
+        let a = ((fg_argb >> 24) & 0xFF) as u16;
+        let r = ((fg_argb >> 16) & 0xFF) as u16;
+        let g = ((fg_argb >>  8) & 0xFF) as u16;
+        let b = ( fg_argb        & 0xFF) as u16;
+        let render_color = XRenderColor {
+            red:   r * 0x101,
+            green: g * 0x101,
+            blue:  b * 0x101,
+            alpha: a * 0x101,
+        };
+        let mut xft_color: xft::XftColor = unsafe { std::mem::zeroed() };
+        unsafe {
+            xft::XftColorAllocValue(
+                xst.display, xst.visual, xst.colormap,
+                &render_color, &mut xft_color,
+            );
+        }
+
+        let draw = unsafe {
+            xft::XftDrawCreate(xst.display, win as u64, xst.visual, xst.colormap)
+        };
+
+        unsafe {
+            xft::XftDrawStringUtf8(
+                draw, &xft_color, font,
+                label_x as i32, label_y as i32,
+                text.as_ptr(), text.len() as i32,
+            );
+            xft::XftDrawDestroy(draw);
+            xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut xft_color);
+            xft::XftFontClose(xst.display, font);
+        }
+
+        Ok(())
+    }
+
+    /// Bitmap font fallback for draw_label when Xft is not available.
+    fn draw_label_bitmap(
+        &self,
+        win: Window,
+        title: &str,
+        tile_x: i16,
+        tile_y: i16,
+        tile_w: u32,
+        tile_h: u32,
+        fg_argb: u32,
+    ) -> Result<(), Box<dyn Error>> {
         let title_bytes = title.as_bytes();
 
-        // Try a size-appropriate core font, falling back to "fixed"
         let font = open_core_font(self.conn, self.config.font.size)?;
         let Some(font) = font else { return Ok(()); };
 
-        // Measure text width for horizontal centering
         let chars: Vec<Char2b> = title_bytes.iter()
             .map(|&b| Char2b { byte1: 0, byte2: b })
             .collect();
@@ -346,7 +457,6 @@ impl<'a> Switcher<'a> {
         let text_w = ext.overall_width.max(0) as u32;
 
         let label_x = tile_x + tile_w.saturating_sub(text_w).wrapping_div(2) as i16;
-        // Baseline near the bottom of the tile
         let label_y = tile_y + tile_h as i16 - 4;
 
         let gc = self.conn.generate_id()?;
@@ -356,8 +466,6 @@ impl<'a> Switcher<'a> {
             .font(font)
         )?.check()?;
 
-        // poly_text8 wire format: [nchars: CARD8, delta: INT8, ...bytes]
-        // Only draws foreground pixels — doesn't overwrite the tile background.
         let mut items = vec![title_bytes.len() as u8, 0u8];
         items.extend_from_slice(title_bytes);
         self.conn.poly_text8(win, gc, label_x, label_y, &items)?.check()?;

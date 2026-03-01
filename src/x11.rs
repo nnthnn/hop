@@ -6,6 +6,55 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
+use x11::xlib;
+
+/// Xft state: a parallel Xlib Display + ARGB Visual used for antialiased text rendering.
+/// Opened separately from the x11rb connection since Xft requires a raw Xlib Display*.
+pub struct XftState {
+    pub display: *mut xlib::Display,
+    pub visual: *mut xlib::Visual,
+    pub colormap: xlib::Colormap,
+    pub screen_num: i32,
+}
+
+// Raw pointers are not Send by default, but our event loop is single-threaded.
+unsafe impl Send for XftState {}
+
+impl XftState {
+    /// Try to initialise Xft. Returns None if the ARGB visual is unavailable.
+    pub fn open() -> Option<Self> {
+        let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+        if display.is_null() {
+            return None;
+        }
+
+        let screen_num = unsafe { xlib::XDefaultScreen(display) };
+
+        // Look for a 32-bit TrueColor visual for ARGB compositing
+        let mut vinfo: xlib::XVisualInfo = unsafe { std::mem::zeroed() };
+        let found = unsafe {
+            xlib::XMatchVisualInfo(display, screen_num, 32, xlib::TrueColor, &mut vinfo)
+        };
+        if found == 0 {
+            unsafe { xlib::XCloseDisplay(display); }
+            return None;
+        }
+
+        let root = unsafe { xlib::XRootWindow(display, screen_num) };
+        let colormap = unsafe {
+            xlib::XCreateColormap(display, root, vinfo.visual, xlib::AllocNone)
+        };
+
+        Some(XftState { display, visual: vinfo.visual, colormap, screen_num })
+    }
+}
+
+impl Drop for XftState {
+    fn drop(&mut self) {
+        unsafe { xlib::XCloseDisplay(self.display); }
+    }
+}
+
 pub struct Display {
     pub conn: RustConnection,
     pub screen_num: usize,
