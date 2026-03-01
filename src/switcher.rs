@@ -225,13 +225,21 @@ impl<'a> Switcher<'a> {
 
             // Icon
             self.draw_icon(win_pic, fmt, win, entry, tile_x, tile_y, tw, th, fg_argb)?;
+        }
 
+        // Commit all XRender work before drawing Xft text on the same window.
+        // The two connections (x11rb + Xlib/Xft) are unordered relative to each other;
+        // flushing x11rb first ensures the tile backgrounds are on screen before the labels.
+        self.conn.render_free_picture(win_pic)?.check()?;
+        self.conn.flush()?;
+
+        for (i, entry) in self.windows.iter().enumerate() {
+            let tile_x = (FRAME_W + i as u32 * (tw + FRAME_W)) as i16;
+            let tile_y = FRAME_W as i16;
             // Title label
             self.draw_label(win, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
 
-        self.conn.render_free_picture(win_pic)?.check()?;
-        self.conn.flush()?;
         Ok(())
     }
 
@@ -429,6 +437,8 @@ impl<'a> Switcher<'a> {
             xft::XftDrawDestroy(draw);
             xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut xft_color);
             xft::XftFontClose(xst.display, font);
+            // Flush the Xlib connection so text reaches the server promptly.
+            x11::xlib::XFlush(xst.display);
         }
 
         Ok(())
