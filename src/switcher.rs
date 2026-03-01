@@ -356,9 +356,9 @@ impl<'a> Switcher<'a> {
             .font(font)
         )?.check()?;
 
-        // poly_text8 wire format: [delta: u8, count: u8, ...bytes]
+        // poly_text8 wire format: [nchars: CARD8, delta: INT8, ...bytes]
         // Only draws foreground pixels — doesn't overwrite the tile background.
-        let mut items = vec![0u8, title_bytes.len() as u8];
+        let mut items = vec![title_bytes.len() as u8, 0u8];
         items.extend_from_slice(title_bytes);
         self.conn.poly_text8(win, gc, label_x, label_y, &items)?.check()?;
 
