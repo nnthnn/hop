@@ -119,50 +119,72 @@ fn find_argb_visual(
     Ok((None, None))
 }
 
-/// Grab Alt+Tab and Alt+Shift+Tab on the root window.
-pub fn grab_keys(conn: &RustConnection, root: Window) -> Result<(), Box<dyn Error>> {
+/// Parse a modifier name ("Alt", "Super", "Ctrl", "Shift") into its mask value (as u32).
+pub fn modifier_mask(s: &str) -> u32 {
+    use x11rb::protocol::xproto::ModMask;
+    match s.trim() {
+        "Super" | "Win" | "Mod4" => u32::from(ModMask::M4),
+        "Ctrl"  | "Control"      => u32::from(ModMask::CONTROL),
+        "Shift"                  => u32::from(ModMask::SHIFT),
+        _                        => u32::from(ModMask::M1),  // "Alt" and anything else
+    }
+}
+
+/// The keysyms for both sides of the given modifier key,
+/// used to detect modifier release in KeyRelease events.
+pub fn modifier_release_keysyms(modifier: &str) -> Vec<u32> {
+    match modifier.trim() {
+        "Super" | "Win"      => vec![0xffeb, 0xffec],  // Super_L, Super_R
+        "Ctrl"  | "Control"  => vec![0xffe3, 0xffe4],  // Control_L, Control_R
+        "Shift"              => vec![0xffe1, 0xffe2],  // Shift_L, Shift_R
+        _                    => vec![0xffe9, 0xffea],  // Alt_L, Alt_R
+    }
+}
+
+/// Parse a key binding string like "Tab", "Shift+Tab", "grave".
+/// Returns `(keysym, extra_modifier_mask)` where the mask is a u32 suitable
+/// for bitwise AND against `u32::from(ev.state)`.
+pub fn parse_key_binding(s: &str) -> (u32, u32) {
+    let parts: Vec<&str> = s.split('+').collect();
+    let key_name = parts.last().copied().unwrap_or(s);
+    let mut extra: u32 = 0;
+    for mod_str in &parts[..parts.len().saturating_sub(1)] {
+        extra |= modifier_mask(mod_str);
+    }
+    (keysym_from_name(key_name), extra)
+}
+
+/// Grab the configured trigger keys on the root window.
+/// Grabs `modifier+next_key` and `modifier+prev_key` (with all lock-key combos).
+pub fn grab_keys(
+    conn: &RustConnection,
+    root: Window,
+    modifier: &str,
+    next_key: &str,
+    prev_key: &str,
+) -> Result<(), Box<dyn Error>> {
     use x11rb::protocol::xproto::{GrabMode, ModMask};
 
-    // Map Tab and Escape key symbols to keycodes
-    let tab_code = keyname_to_keycode(conn, "Tab")?;
-    let esc_code = keyname_to_keycode(conn, "Escape")?;
+    let primary     = ModMask::from(modifier_mask(modifier) as u16);
+    let (next_sym, next_extra_u32) = parse_key_binding(next_key);
+    let (prev_sym, prev_extra_u32) = parse_key_binding(prev_key);
+    let next_extra  = ModMask::from(next_extra_u32 as u16);
+    let prev_extra  = ModMask::from(prev_extra_u32 as u16);
 
-    if let Some(tab) = tab_code {
-        // Alt+Tab (forward)
-        for extra_mod in offending_modifiers(conn)? {
-            conn.grab_key(
-                true,
-                root,
-                ModMask::M1 | extra_mod,
-                tab,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )?
-            .check()?;
-            // Alt+Shift+Tab (backward)
-            conn.grab_key(
-                true,
-                root,
-                ModMask::M1 | ModMask::SHIFT | extra_mod,
-                tab,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )?
-            .check()?;
+    if let Some(next_code) = keysym_to_keycode(conn, next_sym)? {
+        for lock in offending_modifiers(conn)? {
+            conn.grab_key(true, root, primary | next_extra | lock,
+                next_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
         }
     }
 
-    if let Some(esc) = esc_code {
-        for extra_mod in offending_modifiers(conn)? {
-            conn.grab_key(
-                true,
-                root,
-                ModMask::M1 | extra_mod,
-                esc,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )?
-            .check()?;
+    // Grab prev separately only when it differs from next in keycode or modifiers.
+    if prev_sym != next_sym || prev_extra_u32 != next_extra_u32 {
+        if let Some(prev_code) = keysym_to_keycode(conn, prev_sym)? {
+            for lock in offending_modifiers(conn)? {
+                conn.grab_key(true, root, primary | prev_extra | lock,
+                    prev_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
+            }
         }
     }
 
@@ -176,38 +198,37 @@ fn offending_modifiers(conn: &RustConnection) -> Result<Vec<ModMask>, Box<dyn Er
     Ok(locks.to_vec())
 }
 
-/// Look up a keysym name and return a keycode.
-fn keyname_to_keycode(conn: &RustConnection, name: &str) -> Result<Option<Keycode>, Box<dyn Error>> {
-    use x11rb::protocol::xproto::Keycode;
-    let sym = keysym_from_name(name)?;
-    if sym == 0 {
-        return Ok(None);
+/// Map a key name to its X11 keysym. Returns 0 for unrecognised names.
+fn keysym_from_name(name: &str) -> u32 {
+    match name {
+        "Tab"               => 0xff09,
+        "Escape" | "Esc"    => 0xff1b,
+        "Return" | "Enter"  => 0xff0d,
+        "space"  | "Space"  => 0x0020,
+        "grave"  | "quoteleft" => 0x0060,  // backtick / tilde key
+        "F1"  => 0xffbe, "F2"  => 0xffbf, "F3"  => 0xffc0, "F4"  => 0xffc1,
+        "F5"  => 0xffc2, "F6"  => 0xffc3, "F7"  => 0xffc4, "F8"  => 0xffc5,
+        "F9"  => 0xffc6, "F10" => 0xffc7, "F11" => 0xffc8, "F12" => 0xffc9,
+        // Single ASCII character — covers letters, digits, punctuation
+        s if s.len() == 1   => s.chars().next().map_or(0, |c| c as u32),
+        _                   => 0,
     }
+}
+
+/// Look up the keycode for a given keysym by scanning the keyboard mapping.
+fn keysym_to_keycode(conn: &RustConnection, keysym: u32) -> Result<Option<Keycode>, Box<dyn Error>> {
+    if keysym == 0 { return Ok(None); }
     let mapping = conn.get_keyboard_mapping(
         conn.setup().min_keycode,
         conn.setup().max_keycode - conn.setup().min_keycode + 1,
     )?.reply()?;
-
-    let keysyms_per_code = mapping.keysyms_per_keycode as usize;
-    for (i, chunk) in mapping.keysyms.chunks(keysyms_per_code).enumerate() {
-        if chunk.contains(&sym) {
-            let code = conn.setup().min_keycode + i as u8;
-            return Ok(Some(code));
+    let kpk = mapping.keysyms_per_keycode as usize;
+    for (i, chunk) in mapping.keysyms.chunks(kpk).enumerate() {
+        if chunk.contains(&keysym) {
+            return Ok(Some(conn.setup().min_keycode + i as u8));
         }
     }
     Ok(None)
-}
-
-/// Minimal keysym lookup for the keys we care about.
-fn keysym_from_name(name: &str) -> Result<u32, Box<dyn Error>> {
-    // XF86 keysym values — just what we need
-    let sym = match name {
-        "Tab"    => 0xff09,
-        "Escape" => 0xff1b,
-        "Return" => 0xff0d,
-        _        => 0,
-    };
-    Ok(sym)
 }
 
 /// Get the list of mapped windows from EWMH _NET_CLIENT_LIST_STACKING.

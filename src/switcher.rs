@@ -714,6 +714,32 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Return the tile index whose content rect contains popup-relative point (px, py).
+    fn tile_at(&self, px: i16, py: i16) -> Option<usize> {
+        let (n_cols, _) = self.grid_layout();
+        let tw = self.tile_w() as i16;
+        let th = self.tile_h() as i16;
+        for (i, _) in self.windows.iter().enumerate() {
+            let (tx, ty) = self.tile_pos(i, n_cols);
+            if px >= tx && px < tx + tw && py >= ty && py < ty + th {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Handle a mouse click at popup-relative (px, py).
+    /// Activates the clicked tile, or cancels if the click lands outside all tiles.
+    pub fn click_at(&mut self, root: Window, px: i16, py: i16) -> Result<(), Box<dyn Error>> {
+        if let Some(idx) = self.tile_at(px, py) {
+            self.selected = idx;
+            self.commit(root)?;
+        } else {
+            self.cancel()?;
+        }
+        Ok(())
+    }
+
     /// Composite a gradient over `pix_pic` as the window background.
     ///
     /// The gradient always runs from fully transparent to `bg_argb` (at its configured alpha).

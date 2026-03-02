@@ -11,9 +11,7 @@ use config::Config;
 use x11::Display;
 use switcher::Switcher;
 
-// Keysym values
-const XK_TAB: u32    = 0xff09;
-const XK_ESCAPE: u32 = 0xff1b;
+// Return/Enter always commits, regardless of binding config.
 const XK_RETURN: u32 = 0xff0d;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -27,10 +25,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("hop: no ARGB visual, transparency disabled");
     }
 
-    x11::grab_keys(&display.conn, display.root)?;
+    x11::grab_keys(
+        &display.conn, display.root,
+        &config.keys.modifier, &config.keys.next, &config.keys.prev,
+    )?;
     display.conn.flush()?;
 
-    eprintln!("hop: listening for Alt+Tab...");
+    // Pre-compute binding info so we don't re-parse on every keypress.
+    let primary_mask   = x11::modifier_mask(&config.keys.modifier);
+    let (next_sym, next_extra) = x11::parse_key_binding(&config.keys.next);
+    let (prev_sym, prev_extra) = x11::parse_key_binding(&config.keys.prev);
+    let (cancel_sym, _)        = x11::parse_key_binding(&config.keys.cancel);
+    let release_syms           = x11::modifier_release_keysyms(&config.keys.modifier);
+
+    eprintln!("hop: listening for {}+{}...", config.keys.modifier, config.keys.next);
 
     let mut switcher = Switcher::new(&display.conn, &config, &display)?;
     let root = display.root;
@@ -40,20 +48,30 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         match event {
             Event::KeyPress(ev) => {
-                let sym = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
+                let sym  = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
                 let mods = u32::from(ev.state);
-                let alt   = mods & u32::from(ModMask::M1)  != 0;
-                let shift = mods & u32::from(ModMask::SHIFT) != 0;
+                let primary_active = mods & primary_mask != 0;
 
-                if sym == XK_TAB && alt {
+                // is_prev: primary active + all prev extra mods active
+                let is_prev = sym == prev_sym && primary_active
+                    && (prev_extra == 0 || mods & prev_extra != 0);
+                // is_next: primary active, not prev (when same base key), + next extra mods active
+                let is_next = sym == next_sym && primary_active && !is_prev
+                    && (next_extra == 0 || mods & next_extra != 0);
+
+                if is_next {
                     if !switcher.is_visible() {
-                        switcher.show(root, shift)?;
-                    } else if shift {
-                        switcher.prev()?;
+                        switcher.show(root, false)?;
                     } else {
                         switcher.next()?;
                     }
-                } else if sym == XK_ESCAPE && switcher.is_visible() {
+                } else if is_prev {
+                    if !switcher.is_visible() {
+                        switcher.show(root, true)?;
+                    } else {
+                        switcher.prev()?;
+                    }
+                } else if sym == cancel_sym && switcher.is_visible() {
                     switcher.cancel()?;
                 } else if sym == XK_RETURN && switcher.is_visible() {
                     switcher.commit(root)?;
@@ -62,8 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             Event::KeyRelease(ev) => {
                 let sym = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
-                // Alt_L = 0xffe9, Alt_R = 0xffea
-                if (sym == 0xffe9 || sym == 0xffea) && switcher.is_visible() {
+                if release_syms.contains(&sym) && switcher.is_visible() {
                     switcher.commit(root)?;
                 }
             }
@@ -74,9 +91,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            Event::ButtonPress(_) => {
+            Event::ButtonPress(ev) => {
                 if switcher.is_visible() {
-                    switcher.commit(root)?;
+                    match ev.detail {
+                        4 => switcher.prev()?,   // scroll up
+                        5 => switcher.next()?,   // scroll down
+                        _ => switcher.click_at(root, ev.event_x, ev.event_y)?,
+                    }
                 }
             }
 
