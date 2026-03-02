@@ -85,6 +85,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
+            Event::MotionNotify(ev) => {
+                if switcher.is_visible() {
+                    switcher.hover_at(ev.event_x, ev.event_y)?;
+                }
+            }
+
             Event::Expose(ev) => {
                 if switcher.popup_window() == Some(ev.window) {
                     switcher.redraw()?;

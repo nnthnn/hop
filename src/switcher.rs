@@ -215,7 +215,7 @@ impl<'a> Switcher<'a> {
             .colormap(self.colormap)
             .override_redirect(1u32)
             .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS | EventMask::KEY_RELEASE
-                        | EventMask::BUTTON_PRESS);
+                        | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION);
 
         self.conn.create_window(
             32,                          // depth
@@ -726,6 +726,18 @@ impl<'a> Switcher<'a> {
             }
         }
         None
+    }
+
+    /// Update selection when the pointer moves over a tile. Only redraws if the
+    /// hovered tile differs from the current selection; ignores motion outside tiles.
+    pub fn hover_at(&mut self, px: i16, py: i16) -> Result<(), Box<dyn Error>> {
+        if let Some(idx) = self.tile_at(px, py) {
+            if idx != self.selected {
+                self.selected = idx;
+                self.redraw()?;
+            }
+        }
+        Ok(())
     }
 
     /// Handle a mouse click at popup-relative (px, py).
