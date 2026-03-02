@@ -7,7 +7,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt,
     Color as RenderColor,
-    PictOp, PictType, CreatePictureAux, Transform,
+    PictOp, PictType, CreatePictureAux, Transform, Pointfix,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -17,6 +17,7 @@ use crate::x11 as xh;
 // FRAME_W is now read from config.window.border_width (see frame_w()).
 const LABEL_H: u32 = 48;    // pixels reserved at the bottom of each tile for the title label
 const TITLE_MAX_CHARS: usize = 100; // hard cap so absurdly long titles don't bust layout
+const SCREEN_MARGIN: u32 = 40;     // minimum gap (px) between popup edge and screen edge
 
 pub struct WindowEntry {
     pub id: Window,
@@ -130,14 +131,70 @@ impl<'a> Switcher<'a> {
     fn tile_pad(&self) -> u32 { self.config.tile.padding }
     fn win_pad(&self) -> u32 { self.config.window.padding }
 
-    fn popup_dims(&self) -> (i16, i16, u16, u16) {
-        let n = self.windows.len() as u32;
-        let fw = self.frame_w();
+    /// Compute how many columns (and resulting rows) fit without the popup
+    /// getting within SCREEN_MARGIN pixels of the screen edges.
+    fn grid_layout(&self) -> (usize, usize) {
+        let n = self.windows.len();
+        if n == 0 { return (1, 0); }
+        let tw  = self.tile_w();
+        let fw  = self.frame_w();
         let gap = self.gap_w();
-        let wp = self.win_pad();
-        // Layout: [wp][fw][tile][fw][gap][fw][tile][fw][wp]
-        let w = (self.tile_w() + fw) * n + fw + n.saturating_sub(1) * gap + 2 * wp;
-        let h = self.tile_h() + 2 * fw + 2 * wp;
+        let wp  = self.win_pad();
+        // Each tile slot is (tw + fw + gap) wide; the window also needs fw + 2*wp overhead.
+        // Solving: n_cols*(tw+fw+gap) ≤ available - fw - 2*wp + gap
+        let available = (self.screen_w as u32).saturating_sub(2 * SCREEN_MARGIN);
+        let slot   = (tw + fw + gap).max(1);
+        let budget = available.saturating_sub(fw + 2 * wp).saturating_add(gap);
+        let n_cols = ((budget / slot) as usize).max(1).min(n);
+        let n_rows = (n + n_cols - 1) / n_cols;
+        (n_cols, n_rows)
+    }
+
+    /// Top-left content corner of tile `i` in popup-relative coordinates.
+    fn tile_pos(&self, i: usize, n_cols: usize) -> (i16, i16) {
+        let nc  = n_cols.max(1);
+        let col = (i % nc) as u32;
+        let row = (i / nc) as u32;
+        let fw  = self.frame_w();
+        let gap = self.gap_w();
+        let wp  = self.win_pad();
+        let tw  = self.tile_w();
+        let th  = self.tile_h();
+        let slot = tw + fw + gap; // horizontal stride per tile column
+
+        // If the last row is not full, offset tiles according to last_row_position.
+        let x_extra: u32 = {
+            let n = self.windows.len();
+            let n_rows = (n + nc - 1) / nc;
+            let last_row = n_rows.saturating_sub(1);
+            if row as usize == last_row {
+                let last_count = n - last_row * nc;
+                let missing = (nc - last_count) as u32;
+                match self.config.window.last_row_position.as_str() {
+                    "center" if missing > 0 => missing * slot / 2,
+                    "right"  if missing > 0 => missing * slot,
+                    _ => 0, // "left" or full row
+                }
+            } else {
+                0
+            }
+        };
+
+        let x = (wp + fw + col * slot + x_extra) as i16;
+        let y = (wp + fw + row * (th + fw + gap)) as i16;
+        (x, y)
+    }
+
+    fn popup_dims(&self) -> (i16, i16, u16, u16) {
+        let (n_cols, n_rows) = self.grid_layout();
+        let nc  = n_cols as u32;
+        let nr  = n_rows as u32;
+        let fw  = self.frame_w();
+        let gap = self.gap_w();
+        let wp  = self.win_pad();
+        // Layout per axis: [wp][fw][tile][fw][gap]...[fw][tile][fw][wp]
+        let w = (self.tile_w() + fw) * nc + fw + nc.saturating_sub(1) * gap + 2 * wp;
+        let h = (self.tile_h() + fw) * nr + fw + nr.saturating_sub(1) * gap + 2 * wp;
         let x = ((self.screen_w as u32).saturating_sub(w) / 2) as i16;
         let y = ((self.screen_h as u32).saturating_sub(h) / 2) as i16;
         (x, y, w as u16, h as u16)
@@ -185,15 +242,12 @@ impl<'a> Switcher<'a> {
             // compositor blurs only behind each tile — not the gaps between them.
             // When window blur is set (or both), pass an empty slice (= whole window).
             let rects: Vec<(i16, i16, u16, u16)> = if !self.config.window.blur && self.config.tile.blur {
-                let fw = self.frame_w();
-                let gap = self.gap_w();
-                let wp = self.win_pad();
+                let (n_cols, _) = self.grid_layout();
                 let tw = self.tile_w();
                 let th = self.tile_h();
                 self.windows.iter().enumerate()
                     .map(|(i, _)| {
-                        let tx = (wp + fw + i as u32 * (tw + fw + gap)) as i16;
-                        let ty = (wp + fw) as i16;
+                        let (tx, ty) = self.tile_pos(i, n_cols);
                         (tx, ty, tw as u16, th as u16)
                     })
                     .collect()
@@ -255,22 +309,29 @@ impl<'a> Switcher<'a> {
         let pix_pic = self.conn.generate_id()?;
         self.conn.render_create_picture(pix_pic, pixmap, fmt, &CreatePictureAux::new())?.check()?;
 
-        // Fill pixmap with the window background (transparent by default, so the
-        // compositor shows through; raise window_bg_alpha for a tinted backdrop).
-        let (wbr, wbg, wbb, wba) = argb_to_render_color(window_bg_argb);
-        self.conn.render_fill_rectangles(
-            PictOp::SRC, pix_pic,
-            RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba },
-            &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
-        )?.check()?;
+        // Fill pixmap with the window background. Either a flat fill or a gradient.
+        let gradient_mode = self.config.window.background_gradient.as_str();
+        if gradient_mode == "none" {
+            let (wbr, wbg, wbb, wba) = argb_to_render_color(window_bg_argb);
+            self.conn.render_fill_rectangles(
+                PictOp::SRC, pix_pic,
+                RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba },
+                &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
+            )?.check()?;
+        } else {
+            // Clear to transparent, then composite gradient on top.
+            self.conn.render_fill_rectangles(
+                PictOp::SRC, pix_pic,
+                RenderColor { red: 0, green: 0, blue: 0, alpha: 0 },
+                &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
+            )?.check()?;
+            self.draw_bg_gradient(pix_pic, pw, ph, window_bg_argb, gradient_mode)?;
+        }
 
-        let fw_u32 = self.frame_w();
-        let fw = fw_u32 as u16;
-        let gap = self.gap_w();
-        let wp = self.win_pad();
+        let fw = self.frame_w() as u16;
+        let (n_cols, _) = self.grid_layout();
         for (i, entry) in self.windows.iter().enumerate() {
-            let tile_x = (wp + fw_u32 + i as u32 * (tw + fw_u32 + gap)) as i16;
-            let tile_y = (wp + fw_u32) as i16;
+            let (tile_x, tile_y) = self.tile_pos(i, n_cols);
 
             // Tile background — OVER composites on top of the window background.
             let (ar, ag, ab, aa) = argb_to_render_color(bg_argb);
@@ -299,8 +360,7 @@ impl<'a> Switcher<'a> {
 
         // Redraw the selected tile's frame on top so it's never occluded by an
         // adjacent tile's border (left/right borders share the same X coordinate).
-        let sel_x = (wp + fw_u32 + self.selected as u32 * (tw + fw_u32 + gap)) as i16;
-        let sel_y = (wp + fw_u32) as i16;
+        let (sel_x, sel_y) = self.tile_pos(self.selected, n_cols);
         let (fr, fg_c, fb, fa) = argb_to_render_color(frame_argb);
         self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
             RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
@@ -318,8 +378,7 @@ impl<'a> Switcher<'a> {
 
         // Draw Xft text labels onto the off-screen pixmap.
         for (i, entry) in self.windows.iter().enumerate() {
-            let tile_x = (wp + fw_u32 + i as u32 * (tw + fw_u32 + gap)) as i16;
-            let tile_y = (wp + fw_u32) as i16;
+            let (tile_x, tile_y) = self.tile_pos(i, n_cols);
             self.draw_label(pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
 
@@ -652,6 +711,76 @@ impl<'a> Switcher<'a> {
             self.conn.flush()?;
         }
         self.windows.clear();
+        Ok(())
+    }
+
+    /// Composite a gradient over `pix_pic` as the window background.
+    ///
+    /// The gradient always runs from fully transparent to `bg_argb` (at its configured alpha).
+    /// `mode` controls the shape: "radial" (opaque center, transparent edges),
+    /// "vertical" (transparent top → opaque bottom), "horizontal" (transparent left → opaque right).
+    fn draw_bg_gradient(
+        &self,
+        pix_pic: u32,
+        pw: u16,
+        ph: u16,
+        bg_argb: u32,
+        mode: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let (opr, opg, opb, opa) = argb_to_render_color(bg_argb);
+        let color_bg    = RenderColor { red: opr, green: opg, blue: opb, alpha: opa };
+        let color_trans = RenderColor { red: 0, green: 0, blue: 0, alpha: 0 };
+
+        // Two stops: 0.0 and 1.0 in 16.16 fixed-point
+        let stops: &[i32] = &[0, 65536];
+
+        let grad_pic = self.conn.generate_id()?;
+
+        match mode {
+            "radial" => {
+                // Center is opaque background, edges fade to transparent.
+                let cx = pw as i32 * 32768; // pw/2 in 16.16
+                let cy = ph as i32 * 32768; // ph/2 in 16.16
+                // Outer radius = distance from center to corner (in pixels × 65536)
+                let outer_r = (((pw as f64 * 0.5).hypot(ph as f64 * 0.5)) * 65536.0) as i32;
+                let center = Pointfix { x: cx, y: cy };
+                self.conn.render_create_radial_gradient(
+                    grad_pic,
+                    center, center,
+                    0,       // inner radius
+                    outer_r, // outer radius
+                    stops,
+                    &[color_bg, color_trans], // center = bg, edge = transparent
+                )?.check()?;
+            }
+            "horizontal" => {
+                // Left = transparent, right = background color.
+                let p1 = Pointfix { x: 0, y: 0 };
+                let p2 = Pointfix { x: pw as i32 * 65536, y: 0 };
+                self.conn.render_create_linear_gradient(
+                    grad_pic, p1, p2, stops, &[color_trans, color_bg],
+                )?.check()?;
+            }
+            _ => {
+                // "vertical" (default): transparent top → opaque bottom.
+                let p1 = Pointfix { x: 0, y: 0 };
+                let p2 = Pointfix { x: 0, y: ph as i32 * 65536 };
+                self.conn.render_create_linear_gradient(
+                    grad_pic, p1, p2, stops, &[color_trans, color_bg],
+                )?.check()?;
+            }
+        }
+
+        self.conn.render_composite(
+            PictOp::OVER,
+            grad_pic, 0u32, pix_pic,
+            0, 0,  // src x, y
+            0, 0,  // mask x, y
+            0, 0,  // dst x, y
+            pw, ph,
+        )?.check()?;
+
+        self.conn.render_free_picture(grad_pic)?.check()?;
         Ok(())
     }
 

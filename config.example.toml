@@ -10,12 +10,31 @@ outer_border_width = 0           # X11 border around the popup (px); 0 = no oute
 border             = "#6272a4ff" # outer border color
 gap                = 0           # extra pixels of space between adjacent tiles
 padding            = 0           # margin around the tile area (extends the window background)
+last_row_position  = "center"    # alignment of tiles in an incomplete last row: left|center|right
 # Popup background — visible in the border and gap areas around/between tiles.
 # Default is fully transparent ("00" alpha) so the compositor shows through.
 background         = "#282a36ff"
+# Gradient direction for the window background.
+# "none"       = flat fill (use background color as-is)
+# "radial"     = opaque background at center, fades to transparent at the edges
+# "vertical"   = transparent at top, background color at bottom
+# "horizontal" = transparent at left, background color at right
+# Combine with a semi-transparent background (e.g. "#282a3680") for best results.
+background_gradient = "none"
 # Apply compositor blur behind the entire popup window.
-# Requires picom to have blur-background = true in its own config.
+# When blur = true, hop will also ensure picom has blur-background = true and
+# will configure blur-method / blur-strength below if they are not already set.
 blur               = false
+# picom blur method (dual_kawase, gaussian, box, kernel). Only written to picom's
+# config if hop needs to enable blur-background itself.
+blur_method        = "dual_kawase"
+# picom blur strength. For dual_kawase: 1–20, higher = more blur.
+blur_strength      = 5
+# Show picom drop shadow on the popup. When false, hop adds itself to shadow-exclude.
+shadow             = false
+# Show picom rounded corners on the popup. When false, hop adds itself to
+# rounded-corners-exclude.
+corners            = false
 
 [tile]
 width        = 200

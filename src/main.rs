@@ -85,39 +85,69 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// If picom is running and blur is disabled, ensure hop is in picom's
-/// blur-background-exclude list and reload picom so the change takes effect.
+/// Sync picom's config with hop's settings for blur, shadow, and rounded corners.
 fn maybe_configure_picom(config: &Config) {
-    if config.window.blur || config.tile.blur {
-        return;
-    }
-    let Some(pid) = find_process_pid("picom") else { return; };
+    let want_blur    = config.window.blur || config.tile.blur;
+    let want_shadow  = config.window.shadow;
+    let want_corners = config.window.corners;
+
+    let Some(_pid) = find_process_pid("picom") else { return; };
     let Some(path) = find_picom_config() else {
-        eprintln!(
-            "hop: picom detected (pid {pid}) but config not found; \
-             add \"class_g = 'hop'\" to blur-background-exclude manually"
-        );
+        let need_exclude = !want_blur || !want_shadow || !want_corners;
+        if need_exclude {
+            eprintln!(
+                "hop: picom detected but config not found; \
+                 add \"class_g = 'hop'\" to the relevant exclude lists manually"
+            );
+        }
         return;
     };
     let Ok(content) = std::fs::read_to_string(&path) else { return; };
 
-    // Already configured — nothing to do.
-    if content.contains("class_g = 'hop'") || content.contains("class_g = \"hop\"") {
-        return;
+    let mut new_content = content.clone();
+    let mut changed = false;
+
+    // Sync each exclude list independently.
+    for (want, list_key, label) in [
+        (want_blur,    "blur-background-exclude",  "blur-background-exclude"),
+        (want_shadow,  "shadow-exclude",            "shadow-exclude"),
+        (want_corners, "rounded-corners-exclude",   "rounded-corners-exclude"),
+    ] {
+        let excluded = is_in_picom_exclude(&new_content, list_key);
+        if want && excluded {
+            new_content = remove_picom_exclude(&new_content, list_key);
+            changed = true;
+            eprintln!("hop: removed hop from picom {label} in {}", path.display());
+        } else if !want && !excluded {
+            new_content = patch_picom_exclude(&new_content, list_key);
+            changed = true;
+            eprintln!("hop: added hop to picom {label} in {}", path.display());
+        }
     }
 
-    let new_content = patch_picom_blur_exclude(&content);
-    match std::fs::write(&path, &new_content) {
-        Ok(()) => {
-            eprintln!("hop: added hop to picom blur-background-exclude in {}", path.display());
-            // Ask picom to reload its config.
-            let _ = std::process::Command::new("pkill").args(["-USR1", "picom"]).status();
+    // If blur is wanted, also ensure picom has blur-background = true.
+    if want_blur {
+        if let Some(patched) = ensure_picom_blur_on(
+            &new_content,
+            &config.window.blur_method,
+            config.window.blur_strength,
+        ) {
+            new_content = patched;
+            changed = true;
+            eprintln!(
+                "hop: enabled blur-background = true in {} (method={}, strength={})",
+                path.display(), config.window.blur_method, config.window.blur_strength,
+            );
         }
-        Err(e) => eprintln!(
-            "hop: couldn't update {}: {e}; \
-             add \"class_g = 'hop'\" to blur-background-exclude manually",
-            path.display()
-        ),
+    }
+
+    if changed {
+        match std::fs::write(&path, &new_content) {
+            Ok(()) => {
+                let _ = std::process::Command::new("pkill").args(["-USR1", "picom"]).status();
+            }
+            Err(e) => eprintln!("hop: couldn't update {}: {e}", path.display()),
+        }
     }
 }
 
@@ -158,24 +188,40 @@ fn find_picom_config() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Insert `"class_g = 'hop'"` into an existing `blur-background-exclude` list,
-/// or append a new one if the key is absent.
-fn patch_picom_blur_exclude(content: &str) -> String {
+/// Check whether hop's rule is currently in a named picom exclude list.
+fn is_in_picom_exclude(content: &str, list_key: &str) -> bool {
+    // Check for a block we appended.
+    if content.contains(&format!("\n# Added by hop\n{list_key} = [")) {
+        return true;
+    }
+    // Check inside an existing user-written list.
+    if let Some(kw_pos) = content.find(list_key) {
+        let after = &content[kw_pos..];
+        if let Some(open_rel) = after.find('[') {
+            let open_abs = kw_pos + open_rel + 1;
+            if let Some(close_rel) = content[open_abs..].find(']') {
+                let inner = &content[open_abs..open_abs + close_rel];
+                return inner.contains("class_g = 'hop'")
+                    || inner.contains("class_g = \"hop\"");
+            }
+        }
+    }
+    false
+}
+
+/// Insert `"class_g = 'hop'"` into a named picom exclude list,
+/// or append a new list block if the key is absent.
+fn patch_picom_exclude(content: &str, list_key: &str) -> String {
     let rule = "\"class_g = 'hop'\"";
 
-    // Try to find an existing blur-background-exclude = [ ... ] block.
-    if let Some(kw_pos) = content.find("blur-background-exclude") {
-        let after_kw = &content[kw_pos..];
-        if let Some(open_rel) = after_kw.find('[') {
+    if let Some(kw_pos) = content.find(list_key) {
+        let after = &content[kw_pos..];
+        if let Some(open_rel) = after.find('[') {
             let open_abs = kw_pos + open_rel + 1;
             if let Some(close_rel) = content[open_abs..].find(']') {
                 let close_abs = open_abs + close_rel;
                 let inner = content[open_abs..close_abs].trim_end();
-                let sep = if inner.is_empty() || inner.ends_with(',') {
-                    "\n  "
-                } else {
-                    ",\n  "
-                };
+                let sep = if inner.is_empty() || inner.ends_with(',') { "\n  " } else { ",\n  " };
                 let mut out = content[..close_abs].to_string();
                 out.push_str(sep);
                 out.push_str(rule);
@@ -185,13 +231,102 @@ fn patch_picom_blur_exclude(content: &str) -> String {
         }
     }
 
-    // No existing key — append a new block.
     let mut out = content.to_string();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&format!("\n# Added by hop\nblur-background-exclude = [\n  {rule}\n];\n"));
+    if !out.ends_with('\n') { out.push('\n'); }
+    out.push_str(&format!("\n# Added by hop\n{list_key} = [\n  {rule}\n];\n"));
     out
+}
+
+/// Remove `"class_g = 'hop'"` from a named picom exclude list.
+/// Removes the entire `# Added by hop` block if hop wrote it, otherwise
+/// strips just the rule line from a user-written list.
+fn remove_picom_exclude(content: &str, list_key: &str) -> String {
+    // First try: remove the entire "# Added by hop\n{list_key} = [...];\n" block.
+    let block_prefix = format!("\n# Added by hop\n{list_key} = [");
+    if let Some(bs) = content.find(&block_prefix) {
+        let from = bs + block_prefix.len() - 1; // rewind to the '['
+        if let Some(rel) = content[from..].find("];\n") {
+            let be = from + rel + 3;
+            let mut out = content[..bs].to_string();
+            out.push_str(&content[be..]);
+            return out;
+        }
+    }
+
+    // Second try: remove just the rule from a user-written list.
+    let sq = "\"class_g = 'hop'\"";
+    let dq = "\"class_g = \\\"hop\\\"\"";
+    let patterns = [
+        format!(",\n  {sq}"), format!("{sq},\n  "), format!("\n  {sq}"), sq.to_string(),
+        format!(",\n  {dq}"), format!("{dq},\n  "), format!("\n  {dq}"), dq.to_string(),
+    ];
+    for pat in &patterns {
+        if let Some(pos) = content.find(pat.as_str()) {
+            let mut out = content[..pos].to_string();
+            out.push_str(&content[pos + pat.len()..]);
+            return out;
+        }
+    }
+
+    content.to_string()
+}
+
+/// Sync picom's blur settings to match hop's config.
+/// Sets blur-background = true, blur-method, and blur-strength — updating existing values
+/// or appending them if absent. Returns `Some(new_content)` if anything changed.
+fn ensure_picom_blur_on(content: &str, method: &str, strength: u32) -> Option<String> {
+    let mut result = content.to_string();
+    let mut changed = false;
+
+    changed |= set_picom_setting(&mut result, "blur-background", "true");
+    changed |= set_picom_setting(&mut result, "blur-method", &format!("\"{method}\""));
+    changed |= set_picom_setting(&mut result, "blur-strength", &strength.to_string());
+
+    if changed { Some(result) } else { None }
+}
+
+/// Set `key = value;` in a picom config string.
+/// Finds and replaces an existing non-commented assignment for the key,
+/// or appends the setting if not found. Returns true if the content changed.
+/// Safely handles keys that share a prefix (e.g. "blur-background" vs "blur-background-exclude")
+/// by requiring the character after the key to be `=` or whitespace.
+fn set_picom_setting(content: &mut String, key: &str, value: &str) -> bool {
+    let desired = format!("{key} = {value};");
+
+    // Find the byte range of the line that currently sets this key.
+    let replace_range = {
+        let mut line_start = 0;
+        let mut found = None;
+        for line in content.lines() {
+            let line_end = line_start + line.len();
+            let trimmed = line.trim();
+            if !trimmed.starts_with('#') {
+                if let Some(rest) = trimmed.strip_prefix(key) {
+                    if rest.trim_start().starts_with('=') {
+                        // Accept with or without trailing semicolon as "already correct".
+                        if trimmed == desired || trimmed == format!("{key} = {value}") {
+                            return false;
+                        }
+                        found = Some(line_start..line_end);
+                        break;
+                    }
+                }
+            }
+            line_start = line_end + 1; // +1 for '\n'
+        }
+        found
+    };
+
+    if let Some(range) = replace_range {
+        content.replace_range(range, &desired);
+    } else {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&desired);
+        content.push('\n');
+    }
+    true
 }
 
 /// Translate a keycode + modifier state into a keysym.

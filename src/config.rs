@@ -30,9 +30,23 @@ pub struct WindowConfig {
     /// Default is "#00000000" (fully transparent — compositor shows through).
     #[serde(default = "default_window_bg")]
     pub background: String,
+    /// Gradient direction for the window background.
+    /// "none" = flat fill, "radial" = opaque center / transparent edges,
+    /// "vertical" = transparent top → opaque bottom,
+    /// "horizontal" = transparent left → opaque right.
+    #[serde(default = "default_background_gradient")]
+    pub background_gradient: String,
     /// Apply compositor blur behind the entire popup window.
     #[serde(default = "default_true")]
     pub blur: bool,
+    /// picom blur-method to configure if hop enables blur in picom's config.
+    /// Supported values: dual_kawase, gaussian, box, kernel.
+    #[serde(default = "default_blur_method")]
+    pub blur_method: String,
+    /// picom blur-strength to configure if hop enables blur in picom's config.
+    /// For dual_kawase the useful range is 1–20; higher = more blur.
+    #[serde(default = "default_blur_strength")]
+    pub blur_strength: u32,
     /// Extra pixels of space between adjacent tiles (beyond the tile border).
     #[serde(default)]
     pub gap: u32,
@@ -40,6 +54,18 @@ pub struct WindowConfig {
     /// Extends the window background on all four sides beyond the tiles.
     #[serde(default)]
     pub padding: u32,
+    /// Alignment of tiles in the last row when it is not full.
+    /// Accepted values: "left", "center", "right". Default: "center".
+    #[serde(default = "default_last_row_position")]
+    pub last_row_position: String,
+    /// Show picom drop shadow on the popup. When false, hop adds itself to
+    /// picom's shadow-exclude list. Default: false (no shadow).
+    #[serde(default)]
+    pub shadow: bool,
+    /// Show picom rounded corners on the popup. When false, hop adds itself to
+    /// picom's rounded-corners-exclude list. Default: false (no rounded corners).
+    #[serde(default)]
+    pub corners: bool,
 }
 
 /// Settings that apply to each individual tile.
@@ -100,6 +126,7 @@ pub struct KeysConfig {
 fn default_true() -> bool { true }
 
 fn default_position() -> String { "center".into() }
+fn default_last_row_position() -> String { "center".into() }
 fn default_window_bg() -> String { "#00000000".into() }  // fully transparent
 fn default_border() -> String { "#6272a4ff".into() }
 
@@ -111,6 +138,11 @@ fn default_bg() -> String { "#282a36cc".into() }  // 0xcc = ~80% opaque
 fn default_fg() -> String { "#f8f8f2ff".into() }
 fn default_frame() -> String { "#bd93f9ff".into() }
 fn default_inactive() -> String { "#44475aff".into() }
+
+fn default_background_gradient() -> String { "none".into() }
+
+fn default_blur_method() -> String { "dual_kawase".into() }
+fn default_blur_strength() -> u32 { 5 }
 
 fn default_font_name() -> String { "sans".into() }
 fn default_font_size() -> u32 { 11 }
