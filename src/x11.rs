@@ -318,22 +318,33 @@ pub fn get_window_icon(
     }
 }
 
-/// Hint to the compositor (picom/KWin) to blur behind this window.
-pub fn set_blur_hint(conn: &RustConnection, window: Window, radius: u32) -> Result<(), Box<dyn Error>> {
-    if radius == 0 {
-        return Ok(());
-    }
+/// Hint to the compositor (picom/KWin) to blur behind specific regions of this window.
+///
+/// Pass an empty slice to blur the entire window area.
+/// Pass a non-empty slice of `(x, y, w, h)` rectangles to blur only those regions.
+pub fn set_blur_hint(
+    conn: &RustConnection,
+    window: Window,
+    rects: &[(i16, i16, u16, u16)],
+) -> Result<(), Box<dyn Error>> {
     let atom = intern_atom(conn, "_KDE_NET_WM_BLUR_BEHIND_REGION")?;
     if atom == 0 {
         return Ok(());
     }
-    // Empty region = blur the whole window
+    let data: Vec<u32> = if rects.is_empty() {
+        // Empty property = blur the whole window
+        vec![]
+    } else {
+        rects.iter()
+            .flat_map(|&(x, y, w, h)| [x as u32, y as u32, w as u32, h as u32])
+            .collect()
+    };
     conn.change_property32(
         PropMode::REPLACE,
         window,
         atom,
         AtomEnum::CARDINAL,
-        &[],
+        &data,
     )?.check()?;
     Ok(())
 }
@@ -361,13 +372,82 @@ pub fn set_skip_taskbar(conn: &RustConnection, window: Window) -> Result<(), Box
     Ok(())
 }
 
-/// Set the active window via _NET_ACTIVE_WINDOW.
+/// Return true if the window should be excluded from the switcher.
+/// Filters out panels, docks, the desktop, splashes, and notification windows.
+pub fn should_skip_window(conn: &RustConnection, window: Window) -> bool {
+    let Ok(wt_atom) = intern_atom(conn, "_NET_WM_WINDOW_TYPE") else { return false; };
+    if wt_atom == 0 {
+        return false;
+    }
+    let Ok(cookie) = conn.get_property(false, window, wt_atom, AtomEnum::ATOM, 0, 32) else {
+        return false;
+    };
+    let Ok(reply) = cookie.reply() else {
+        return false;
+    };
+    if reply.format != 32 {
+        return false;
+    }
+    let window_types: Vec<u32> = reply.value32().unwrap().collect();
+
+    for type_name in &[
+        "_NET_WM_WINDOW_TYPE_DESKTOP",
+        "_NET_WM_WINDOW_TYPE_DOCK",
+        "_NET_WM_WINDOW_TYPE_TOOLBAR",
+        "_NET_WM_WINDOW_TYPE_SPLASH",
+        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    ] {
+        if let Ok(atom) = intern_atom(conn, type_name) {
+            if atom != 0 && window_types.contains(&atom) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Get the WM_CLASS class component (the second null-terminated string) for a window.
+pub fn get_wm_class(conn: &RustConnection, window: Window) -> Option<String> {
+    let reply = conn
+        .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    if reply.value.is_empty() {
+        return None;
+    }
+    // WM_CLASS = "instance\0class\0" — we want the class (second part)
+    let parts: Vec<&[u8]> = reply.value.splitn(3, |&b| b == 0).collect();
+    let class_bytes = if parts.len() >= 2 && !parts[1].is_empty() {
+        parts[1]
+    } else {
+        parts[0]
+    };
+    if class_bytes.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(class_bytes).into_owned())
+}
+
+/// Switch to the desktop that `window` lives on, then raise and focus it.
+/// If the window is sticky (desktop == 0xFFFF_FFFF) we skip the desktop switch.
 pub fn activate_window(
     conn: &RustConnection,
     root: Window,
     window: Window,
 ) -> Result<(), Box<dyn Error>> {
     use x11rb::protocol::xproto::{EventMask, ClientMessageEvent, CLIENT_MESSAGE_EVENT};
+
+    // Switch workspace if the window is on a different one.
+    if let Some(target_desk) = get_window_desktop(conn, window) {
+        if target_desk != 0xFFFF_FFFF {
+            let current_desk = get_current_desktop(conn, root).unwrap_or(target_desk);
+            if current_desk != target_desk {
+                switch_to_desktop(conn, root, target_desk)?;
+            }
+        }
+    }
+
     let naw = intern_atom(conn, "_NET_ACTIVE_WINDOW")?;
     let event = ClientMessageEvent {
         response_type: CLIENT_MESSAGE_EVENT,
@@ -376,6 +456,62 @@ pub fn activate_window(
         window,
         type_: naw,
         data: [2, x11rb::CURRENT_TIME, 0, 0, 0].into(),
+    };
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?.check()?;
+    conn.flush()?;
+    Ok(())
+}
+
+/// Return the `_NET_WM_DESKTOP` index for `window`, or `None` if unset.
+fn get_window_desktop(conn: &RustConnection, window: Window) -> Option<u32> {
+    let atom = intern_atom(conn, "_NET_WM_DESKTOP").ok()?;
+    if atom == 0 {
+        return None;
+    }
+    let Ok(cookie) = conn.get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1) else {
+        return None;
+    };
+    let Ok(reply) = cookie.reply() else { return None; };
+    if reply.format != 32 {
+        return None;
+    }
+    let vals: Vec<u32> = reply.value32()?.collect();
+    vals.into_iter().next()
+}
+
+/// Return the index of the currently-visible desktop (`_NET_CURRENT_DESKTOP`).
+fn get_current_desktop(conn: &RustConnection, root: Window) -> Option<u32> {
+    let atom = intern_atom(conn, "_NET_CURRENT_DESKTOP").ok()?;
+    if atom == 0 {
+        return None;
+    }
+    let Ok(cookie) = conn.get_property(false, root, atom, AtomEnum::CARDINAL, 0, 1) else {
+        return None;
+    };
+    let Ok(reply) = cookie.reply() else { return None; };
+    if reply.format != 32 {
+        return None;
+    }
+    let vals: Vec<u32> = reply.value32()?.collect();
+    vals.into_iter().next()
+}
+
+/// Ask the window manager to switch to `desktop` via `_NET_CURRENT_DESKTOP`.
+fn switch_to_desktop(conn: &RustConnection, root: Window, desktop: u32) -> Result<(), Box<dyn Error>> {
+    use x11rb::protocol::xproto::{EventMask, ClientMessageEvent, CLIENT_MESSAGE_EVENT};
+    let ncd = intern_atom(conn, "_NET_CURRENT_DESKTOP")?;
+    let event = ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: root,
+        type_: ncd,
+        data: [desktop, x11rb::CURRENT_TIME, 0, 0, 0].into(),
     };
     conn.send_event(
         false,

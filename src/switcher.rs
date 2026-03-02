@@ -14,8 +14,9 @@ use x11rb::rust_connection::RustConnection;
 use crate::config::Config;
 use crate::x11 as xh;
 
-const FRAME_W: u32 = 8;
-const LABEL_H: u32 = 20; // pixels reserved at the bottom of each tile for the title label
+// FRAME_W is now read from config.window.border_width (see frame_w()).
+const LABEL_H: u32 = 48;    // pixels reserved at the bottom of each tile for the title label
+const TITLE_MAX_CHARS: usize = 100; // hard cap so absurdly long titles don't bust layout
 
 pub struct WindowEntry {
     pub id: Window,
@@ -75,13 +76,27 @@ impl<'a> Switcher<'a> {
         let win_ids = xh::get_window_list(self.conn, root)?;
         self.windows.clear();
 
+        // Extract fields so the loop body can push to self.windows without a borrow conflict.
+        let conn = self.conn;
+        let icon_size = self.config.tile.icon_size;
+
         for id in win_ids {
             if self.popup == Some(id) {
                 continue;
             }
-            let name = xh::get_window_name(self.conn, id).unwrap_or_default();
-            let icon = xh::get_window_icon(self.conn, id, self.config.window.icon_size)
-                .unwrap_or(None);
+            // Skip panels, docks, desktop windows, etc.
+            if xh::should_skip_window(conn, id) {
+                continue;
+            }
+            let name = xh::get_window_name(conn, id).unwrap_or_default();
+            let icon = xh::get_window_icon(conn, id, icon_size).unwrap_or(None);
+            // If _NET_WM_ICON is absent, fall back to the XDG icon theme via WM_CLASS.
+            let icon = if icon.is_none() {
+                xh::get_wm_class(conn, id)
+                    .and_then(|cls| load_icon_file(&cls, icon_size))
+            } else {
+                icon
+            };
             self.windows.push(WindowEntry { id, name, icon });
         }
         Ok(())
@@ -108,13 +123,21 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
-    fn tile_w(&self) -> u32 { self.config.window.tile_width }
-    fn tile_h(&self) -> u32 { self.config.window.tile_height }
+    fn tile_w(&self) -> u32 { self.config.tile.width }
+    fn tile_h(&self) -> u32 { self.config.tile.height }
+    fn frame_w(&self) -> u32 { self.config.tile.border_width.max(1) }
+    fn gap_w(&self) -> u32 { self.config.window.gap }
+    fn tile_pad(&self) -> u32 { self.config.tile.padding }
+    fn win_pad(&self) -> u32 { self.config.window.padding }
 
     fn popup_dims(&self) -> (i16, i16, u16, u16) {
         let n = self.windows.len() as u32;
-        let w = (self.tile_w() + FRAME_W) * n + FRAME_W;
-        let h = self.tile_h() + 2 * FRAME_W;
+        let fw = self.frame_w();
+        let gap = self.gap_w();
+        let wp = self.win_pad();
+        // Layout: [wp][fw][tile][fw][gap][fw][tile][fw][wp]
+        let w = (self.tile_w() + fw) * n + fw + n.saturating_sub(1) * gap + 2 * wp;
+        let h = self.tile_h() + 2 * fw + 2 * wp;
         let x = ((self.screen_w as u32).saturating_sub(w) / 2) as i16;
         let y = ((self.screen_h as u32).saturating_sub(h) / 2) as i16;
         (x, y, w as u16, h as u16)
@@ -123,24 +146,29 @@ impl<'a> Switcher<'a> {
     fn create_popup(&mut self) -> Result<(), Box<dyn Error>> {
         let (x, y, w, h) = self.popup_dims();
         let win = self.conn.generate_id()?;
-        let border_w = self.config.window.border_width as u32;
-        let border_color = Config::color_argb(&self.config.colors.border);
+        let outer_bw = self.config.window.outer_border_width;
+
+        // border_pixel must always be set for 32-bit depth windows — X11 forbids
+        // inheriting a border pixmap across depth mismatches (Match error otherwise).
+        // When outer_bw == 0 the value is irrelevant; use the configured color anyway.
+        let border_color = Config::color_argb(&self.config.window.border);
+        let aux = CreateWindowAux::new()
+            .background_pixel(0u32)  // transparent
+            .border_pixel(border_color)
+            .colormap(self.colormap)
+            .override_redirect(1u32)
+            .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS | EventMask::KEY_RELEASE
+                        | EventMask::BUTTON_PRESS);
 
         self.conn.create_window(
             32,                          // depth
             win,
             self.conn.setup().roots[0].root,
             x, y, w, h,
-            border_w as u16,
+            outer_bw as u16,
             WindowClass::INPUT_OUTPUT,
             self.visual_id,
-            &CreateWindowAux::new()
-                .background_pixel(0u32)  // transparent
-                .border_pixel(border_color)
-                .colormap(self.colormap)
-                .override_redirect(1u32)
-                .event_mask(EventMask::EXPOSURE | EventMask::KEY_PRESS | EventMask::KEY_RELEASE
-                            | EventMask::BUTTON_PRESS),
+            &aux,
         )?.check()?;
 
         xh::set_window_type_dialog(self.conn, win)?;
@@ -152,8 +180,27 @@ impl<'a> Switcher<'a> {
         self.conn.change_property8(PropMode::REPLACE, win, wm_class, AtomEnum::STRING, class_str)?
             .check()?;
 
-        if self.config.blur.enabled {
-            xh::set_blur_hint(self.conn, win, self.config.blur.radius)?;
+        if self.config.window.blur || self.config.tile.blur {
+            // When only tile blur is requested, pass individual tile rectangles so the
+            // compositor blurs only behind each tile — not the gaps between them.
+            // When window blur is set (or both), pass an empty slice (= whole window).
+            let rects: Vec<(i16, i16, u16, u16)> = if !self.config.window.blur && self.config.tile.blur {
+                let fw = self.frame_w();
+                let gap = self.gap_w();
+                let wp = self.win_pad();
+                let tw = self.tile_w();
+                let th = self.tile_h();
+                self.windows.iter().enumerate()
+                    .map(|(i, _)| {
+                        let tx = (wp + fw + i as u32 * (tw + fw + gap)) as i16;
+                        let ty = (wp + fw) as i16;
+                        (tx, ty, tw as u16, th as u16)
+                    })
+                    .collect()
+            } else {
+                vec![]  // empty = whole window
+            };
+            xh::set_blur_hint(self.conn, win, &rects)?;
         }
 
         self.conn.map_window(win)?.check()?;
@@ -169,16 +216,19 @@ impl<'a> Switcher<'a> {
     }
 
     /// Redraw all tiles using XRender for ARGB compositing.
+    /// Uses double buffering: everything is rendered to an off-screen pixmap
+    /// first, then the completed frame is copied to the window in one shot.
     pub fn redraw(&self) -> Result<(), Box<dyn Error>> {
         let win = match self.popup {
             Some(w) => w,
             None => return Ok(()),
         };
 
+        let window_bg_argb = self.config.window_bg_argb();
         let bg_argb = self.config.bg_argb();
-        let fg_argb = Config::color_argb(&self.config.colors.foreground);
-        let frame_argb = Config::color_argb(&self.config.colors.frame);
-        let inact_argb = Config::color_argb(&self.config.colors.inactive);
+        let fg_argb = Config::color_argb(&self.config.tile.foreground);
+        let frame_argb = Config::color_argb(&self.config.tile.frame);
+        let inact_argb = Config::color_argb(&self.config.tile.inactive);
 
         let tw = self.tile_w();
         let th = self.tile_h();
@@ -196,19 +246,36 @@ impl<'a> Switcher<'a> {
             return Ok(());
         };
 
-        // Create Picture for the popup window
-        let win_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?.check()?;
+        let (_, _, pw, ph) = self.popup_dims();
 
+        // Off-screen pixmap: all rendering happens here, invisible to the user.
+        let pixmap = self.conn.generate_id()?;
+        self.conn.create_pixmap(32, pixmap, win, pw, ph)?.check()?;
+
+        let pix_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(pix_pic, pixmap, fmt, &CreatePictureAux::new())?.check()?;
+
+        // Fill pixmap with the window background (transparent by default, so the
+        // compositor shows through; raise window_bg_alpha for a tinted backdrop).
+        let (wbr, wbg, wbb, wba) = argb_to_render_color(window_bg_argb);
+        self.conn.render_fill_rectangles(
+            PictOp::SRC, pix_pic,
+            RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba },
+            &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
+        )?.check()?;
+
+        let fw_u32 = self.frame_w();
+        let fw = fw_u32 as u16;
+        let gap = self.gap_w();
+        let wp = self.win_pad();
         for (i, entry) in self.windows.iter().enumerate() {
-            let tile_x = (FRAME_W + i as u32 * (tw + FRAME_W)) as i16;
-            let tile_y = FRAME_W as i16;
+            let tile_x = (wp + fw_u32 + i as u32 * (tw + fw_u32 + gap)) as i16;
+            let tile_y = (wp + fw_u32) as i16;
 
-            // Background fill with configured alpha
+            // Tile background — OVER composites on top of the window background.
             let (ar, ag, ab, aa) = argb_to_render_color(bg_argb);
             self.conn.render_fill_rectangles(
-                PictOp::SRC,
-                win_pic,
+                PictOp::OVER, pix_pic,
                 RenderColor { red: ar, green: ag, blue: ab, alpha: aa },
                 &[Rectangle { x: tile_x, y: tile_y, width: tw as u16, height: th as u16 }],
             )?.check()?;
@@ -216,9 +283,7 @@ impl<'a> Switcher<'a> {
             // Frame (selected = frame color, others = inactive)
             let frame_color = if i == self.selected { frame_argb } else { inact_argb };
             let (fr, fg_c, fb, fa) = argb_to_render_color(frame_color);
-            let fw = FRAME_W as u16;
-            // Top
-            self.conn.render_fill_rectangles(PictOp::OVER, win_pic,
+            self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
                 RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
                 &[
                     Rectangle { x: tile_x, y: tile_y - fw as i16, width: tw as u16, height: fw },
@@ -229,21 +294,57 @@ impl<'a> Switcher<'a> {
             )?.check()?;
 
             // Icon
-            self.draw_icon(win_pic, fmt, win, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            self.draw_icon(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
 
-        // Commit all XRender work before drawing Xft text on the same window.
-        // The two connections (x11rb + Xlib/Xft) are unordered relative to each other;
-        // flushing x11rb first ensures the tile backgrounds are on screen before the labels.
-        self.conn.render_free_picture(win_pic)?.check()?;
+        // Redraw the selected tile's frame on top so it's never occluded by an
+        // adjacent tile's border (left/right borders share the same X coordinate).
+        let sel_x = (wp + fw_u32 + self.selected as u32 * (tw + fw_u32 + gap)) as i16;
+        let sel_y = (wp + fw_u32) as i16;
+        let (fr, fg_c, fb, fa) = argb_to_render_color(frame_argb);
+        self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
+            RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
+            &[
+                Rectangle { x: sel_x,              y: sel_y - fw as i16,  width: tw as u16,      height: fw },
+                Rectangle { x: sel_x,              y: sel_y + th as i16,  width: tw as u16,      height: fw },
+                Rectangle { x: sel_x - fw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
+                Rectangle { x: sel_x + tw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
+            ],
+        )?.check()?;
+
+        // Flush x11rb so all XRender work is committed to the pixmap before
+        // Xft draws on the same drawable via the separate Xlib connection.
         self.conn.flush()?;
 
+        // Draw Xft text labels onto the off-screen pixmap.
         for (i, entry) in self.windows.iter().enumerate() {
-            let tile_x = (FRAME_W + i as u32 * (tw + FRAME_W)) as i16;
-            let tile_y = FRAME_W as i16;
-            // Title label
-            self.draw_label(win, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            let tile_x = (wp + fw_u32 + i as u32 * (tw + fw_u32 + gap)) as i16;
+            let tile_y = (wp + fw_u32) as i16;
+            self.draw_label(pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
         }
+
+        // XSync the Xlib connection: wait for the server to finish all Xft draws
+        // so the pixmap is complete before we blit it to the window.
+        if let Some(ref xft) = self.xft {
+            unsafe { x11::xlib::XSync(xft.display, 0); }
+        }
+
+        // Blit the completed pixmap to the window in one atomic operation.
+        let win_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.render_composite(
+            PictOp::SRC,
+            pix_pic, 0u32, win_pic,
+            0, 0,   // src x, y
+            0, 0,   // mask x, y
+            0, 0,   // dst x, y
+            pw, ph,
+        )?.check()?;
+
+        self.conn.render_free_picture(win_pic)?.check()?;
+        self.conn.render_free_picture(pix_pic)?.check()?;
+        self.conn.free_pixmap(pixmap)?.check()?;
+        self.conn.flush()?;
 
         Ok(())
     }
@@ -260,10 +361,14 @@ impl<'a> Switcher<'a> {
         tile_h: u32,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
-        let icon_size = self.config.window.icon_size;
-        let icon_x = tile_x + ((tile_w - icon_size) / 2) as i16;
-        // Shift icon up by half of LABEL_H so it sits centered in the non-label area
-        let icon_y = tile_y + (tile_h.saturating_sub(icon_size + LABEL_H) / 2) as i16;
+        let icon_size = self.config.tile.icon_size;
+        let pad = self.tile_pad();
+        // Center icon horizontally within the padded inner region
+        let avail_w = tile_w.saturating_sub(2 * pad);
+        let icon_x = tile_x + (pad as i16) + (avail_w.saturating_sub(icon_size) / 2) as i16;
+        // Center icon vertically in the non-label area, respecting top/bottom padding
+        let avail_icon_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
+        let icon_y = tile_y + (pad as i16) + (avail_icon_h.saturating_sub(icon_size) / 2) as i16;
 
         let (src_w, src_h, pixels) = match &entry.icon {
             Some(icon) => icon,
@@ -349,7 +454,7 @@ impl<'a> Switcher<'a> {
         tile_h: u32,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
-        let title = truncate_title(&entry.name, 24);
+        let title = truncate_title(&entry.name, TITLE_MAX_CHARS);
         if title.is_empty() {
             return Ok(());
         }
@@ -384,7 +489,6 @@ impl<'a> Switcher<'a> {
         let font = unsafe {
             xft::XftFontOpenName(xst.display, xst.screen_num, font_pattern.as_ptr())
         };
-        // If named font not found, fall back to "sans"
         let font = if font.is_null() {
             let fallback = CString::new(format!("sans:size={}", self.config.font.size))?;
             unsafe { xft::XftFontOpenName(xst.display, xst.screen_num, fallback.as_ptr()) }
@@ -395,20 +499,22 @@ impl<'a> Switcher<'a> {
             return Ok(());
         }
 
-        let text = title.as_bytes();
+        // Word-wrap the title to fit within the tile.
+        // h_pad = 10px base + tile_padding for horizontal inset; v_pad for vertical.
+        let h_pad = 10u32.saturating_add(self.tile_pad());
+        let v_pad = self.tile_pad();
+        let inner_w = tile_w.saturating_sub(2 * h_pad);
+        let lines = wrap_text_xft(xst.display, font, title, inner_w);
 
-        // Measure text for centering
-        let mut extents: XGlyphInfo = unsafe { std::mem::zeroed() };
-        unsafe {
-            xft::XftTextExtentsUtf8(
-                xst.display, font,
-                text.as_ptr(), text.len() as i32,
-                &mut extents,
-            );
-        }
-        let text_w = extents.xOff.max(0) as u32;
-        let label_x = tile_x + tile_w.saturating_sub(text_w).wrapping_div(2) as i16;
-        let label_y = tile_y + tile_h as i16 - 4;
+        let line_h = unsafe { (*font).height.max(1) } as u32;
+        let ascent = unsafe { (*font).ascent.max(0) } as i16;
+
+        // Label area starts LABEL_H + v_pad px from the tile bottom
+        let label_top = tile_y + (tile_h.saturating_sub(LABEL_H + v_pad)) as i16;
+
+        // How many lines actually fit in LABEL_H
+        let max_lines = (LABEL_H / line_h).max(1) as usize;
+        let lines: Vec<String> = lines.into_iter().take(max_lines).collect();
 
         // Allocate Xft color from fg_argb
         let a = ((fg_argb >> 24) & 0xFF) as u16;
@@ -433,16 +539,35 @@ impl<'a> Switcher<'a> {
             xft::XftDrawCreate(xst.display, win as u64, xst.visual, xst.colormap)
         };
 
+        for (i, line) in lines.iter().enumerate() {
+            let text = line.as_bytes();
+
+            // Measure for horizontal centering
+            let mut extents: XGlyphInfo = unsafe { std::mem::zeroed() };
+            unsafe {
+                xft::XftTextExtentsUtf8(
+                    xst.display, font,
+                    text.as_ptr(), text.len() as i32,
+                    &mut extents,
+                );
+            }
+            let text_w = extents.xOff.max(0) as u32;
+            let x = tile_x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
+            let y = label_top + ascent + (i as u32 * line_h) as i16;
+
+            unsafe {
+                xft::XftDrawStringUtf8(
+                    draw, &xft_color, font,
+                    x as i32, y as i32,
+                    text.as_ptr(), text.len() as i32,
+                );
+            }
+        }
+
         unsafe {
-            xft::XftDrawStringUtf8(
-                draw, &xft_color, font,
-                label_x as i32, label_y as i32,
-                text.as_ptr(), text.len() as i32,
-            );
             xft::XftDrawDestroy(draw);
             xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut xft_color);
             xft::XftFontClose(xst.display, font);
-            // Flush the Xlib connection so text reaches the server promptly.
             x11::xlib::XFlush(xst.display);
         }
 
@@ -471,8 +596,11 @@ impl<'a> Switcher<'a> {
         let ext = self.conn.query_text_extents(font, &chars)?.reply()?;
         let text_w = ext.overall_width.max(0) as u32;
 
-        let label_x = tile_x + tile_w.saturating_sub(text_w).wrapping_div(2) as i16;
-        let label_y = tile_y + tile_h as i16 - 4;
+        let h_pad = 10u32.saturating_add(self.tile_pad());
+        let v_pad = self.tile_pad();
+        let inner_w = tile_w.saturating_sub(2 * h_pad);
+        let label_x = tile_x + (h_pad as i16) + inner_w.saturating_sub(text_w).wrapping_div(2) as i16;
+        let label_y = tile_y + tile_h as i16 - 4 - v_pad as i16;
 
         let gc = self.conn.generate_id()?;
         self.conn.create_gc(gc, win, &CreateGCAux::new()
@@ -574,6 +702,181 @@ fn truncate_title(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
         format!("{}...", truncated)
     }
+}
+
+/// Search standard XDG icon theme paths for a PNG icon matching `class`.
+/// Tries both the lowercase and original-case class name, and prefers the size
+/// closest to `target_size`. Returns `(width, height, ARGB pixels)` on success.
+fn load_icon_file(class: &str, target_size: u32) -> Option<(u32, u32, Vec<u32>)> {
+    if class.is_empty() {
+        return None;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let name_lower = class.to_lowercase();
+
+    let icon_dirs = [
+        format!("{}/.local/share/icons/hicolor", home),
+        "/usr/share/icons/hicolor".to_string(),
+    ];
+    let sizes = [512u32, 256, 128, 96, 64, 48, 32];
+
+    let mut candidates: Vec<(u64, String)> = Vec::new();
+    for dir in &icon_dirs {
+        for &sz in &sizes {
+            let diff = (sz as i64 - target_size as i64).unsigned_abs();
+            candidates.push((diff, format!("{}/{}x{}/apps/{}.png", dir, sz, sz, name_lower)));
+            if name_lower != class {
+                candidates.push((diff, format!("{}/{}x{}/apps/{}.png", dir, sz, sz, class)));
+            }
+        }
+    }
+    // /usr/share/icons/{name}.png (some apps install here directly, e.g. zed)
+    candidates.push((u64::MAX, format!("/usr/share/icons/{}.png", name_lower)));
+    if name_lower != class {
+        candidates.push((u64::MAX, format!("/usr/share/icons/{}.png", class)));
+    }
+    // pixmaps as last resort
+    candidates.push((u64::MAX, format!("/usr/share/pixmaps/{}.png", name_lower)));
+    if name_lower != class {
+        candidates.push((u64::MAX, format!("/usr/share/pixmaps/{}.png", class)));
+    }
+
+    candidates.sort_by_key(|(d, _)| *d);
+    for (_, path) in &candidates {
+        if let Some(icon) = load_png_file(path) {
+            return Some(icon);
+        }
+    }
+    None
+}
+
+/// Decode a PNG file into `(width, height, ARGB u32 pixels)`.
+/// Only 8-bit-per-channel RGB and RGBA PNGs are supported; returns `None` otherwise.
+fn load_png_file(path: &str) -> Option<(u32, u32, Vec<u32>)> {
+    use png::{BitDepth, ColorType};
+
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+
+    if info.bit_depth != BitDepth::Eight {
+        return None;
+    }
+
+    let w = info.width;
+    let h = info.height;
+    let n = (w as usize) * (h as usize);
+
+    let pixels: Vec<u32> = match info.color_type {
+        ColorType::Rgba => {
+            if buf.len() < n * 4 {
+                return None;
+            }
+            buf[..n * 4]
+                .chunks_exact(4)
+                .map(|c| {
+                    ((c[3] as u32) << 24)
+                        | ((c[0] as u32) << 16)
+                        | ((c[1] as u32) << 8)
+                        | (c[2] as u32)
+                })
+                .collect()
+        }
+        ColorType::Rgb => {
+            if buf.len() < n * 3 {
+                return None;
+            }
+            buf[..n * 3]
+                .chunks_exact(3)
+                .map(|c| {
+                    0xFF00_0000
+                        | ((c[0] as u32) << 16)
+                        | ((c[1] as u32) << 8)
+                        | (c[2] as u32)
+                })
+                .collect()
+        }
+        _ => return None,
+    };
+
+    Some((w, h, pixels))
+}
+
+/// Word-wrap `text` so each line is at most `max_px` pixels wide when rendered
+/// with `font`.  Falls back to character-level breaking for words that are
+/// wider than `max_px` on their own.
+fn wrap_text_xft(
+    display: *mut x11::xlib::Display,
+    font: *mut x11::xft::XftFont,
+    text: &str,
+    max_px: u32,
+) -> Vec<String> {
+    use x11::xft;
+    use x11::xrender::_XGlyphInfo as XGlyphInfo;
+
+    let measure = |s: &str| -> u32 {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() { return 0; }
+        let mut ext: XGlyphInfo = unsafe { std::mem::zeroed() };
+        unsafe {
+            xft::XftTextExtentsUtf8(display, font, bytes.as_ptr(), bytes.len() as i32, &mut ext);
+        }
+        ext.xOff.max(0) as u32
+    };
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for word in &words {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{} {}", current, word)
+        };
+
+        if measure(&candidate) <= max_px {
+            current = candidate;
+        } else {
+            // Flush current line before handling the word
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+
+            if measure(word) <= max_px {
+                // Word fits on a fresh line
+                current = word.to_string();
+            } else {
+                // Word alone is too wide — break at character boundaries
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    let mut trial = chunk.clone();
+                    trial.push(ch);
+                    if measure(&trial) <= max_px || chunk.is_empty() {
+                        chunk = trial;
+                    } else {
+                        lines.push(std::mem::take(&mut chunk));
+                        chunk.push(ch);
+                    }
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
 }
 
 /// Convert a packed 0xAARRGGBB u32 into XRender color components (0–0xFFFF each).

@@ -1,31 +1,39 @@
 # hop configuration
 # Copy to ~/.config/hop/config.toml
+#
+# All colors accept "#rrggbb" (opaque) or "#rrggbbaa" (with alpha).
+# The last two hex digits are the alpha: 00 = transparent, ff = fully opaque.
 
 [window]
-tile_width   = 200
-tile_height  = 150
-icon_size    = 64
-border_width = 4
-position     = "center"   # "center" or "x,y"
+position           = "center"   # "center" or "x,y"
+outer_border_width = 0           # X11 border around the popup (px); 0 = no outer border
+border             = "#6272a4ff" # outer border color
+gap                = 0           # extra pixels of space between adjacent tiles
+padding            = 0           # margin around the tile area (extends the window background)
+# Popup background — visible in the border and gap areas around/between tiles.
+# Default is fully transparent ("00" alpha) so the compositor shows through.
+background         = "#282a36ff"
+# Apply compositor blur behind the entire popup window.
+# Requires picom to have blur-background = true in its own config.
+blur               = false
 
-[colors]
-background = "#282a36"
-bg_alpha   = 0.80         # 0.0 (transparent) – 1.0 (opaque)
-foreground = "#f8f8f2"
-frame      = "#bd93f9"    # selected tile border
-inactive   = "#44475a"    # unselected tile border
-border     = "#6272a4"    # outer window border
+[tile]
+width        = 200
+height       = 150
+icon_size    = 64
+border_width = 4    # tile frame thickness (px)
+padding      = 0    # pixels of padding inside each tile around content (icon + label)
+background   = "#282a36cc"  # cc ≈ 80% opaque; use "ff" for solid, "00" for transparent
+foreground   = "#f8f8f2ff"  # text and icon placeholder color
+frame        = "#bd93f9ff"  # selected tile border
+inactive     = "#44475aff"  # unselected tile border; "00" alpha = invisible border
+# Apply compositor blur only behind each tile region (not the gaps between tiles).
+# Set window.blur = false and tile.blur = true for tile-only blur.
+blur         = false
 
 [font]
 name = "Roboto"
 size = 11
-
-[blur]
-enabled = true
-# Hint passed to the compositor via _KDE_NET_WM_BLUR_BEHIND_REGION.
-# Picom must have blur-background = true in its own config for this to work.
-# Set to 0 to disable the blur hint entirely.
-radius = 10
 
 [keys]
 modifier = "Alt"

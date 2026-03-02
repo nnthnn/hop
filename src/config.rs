@@ -6,43 +6,73 @@ pub struct Config {
     #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
-    pub colors: ColorsConfig,
+    pub tile: TileConfig,
     #[serde(default)]
     pub font: FontConfig,
-    #[serde(default)]
-    pub blur: BlurConfig,
     #[serde(default)]
     pub keys: KeysConfig,
 }
 
+/// Settings that apply to the popup window as a whole.
 #[derive(Debug, Deserialize)]
 pub struct WindowConfig {
-    #[serde(default = "default_tile_width")]
-    pub tile_width: u32,
-    #[serde(default = "default_tile_height")]
-    pub tile_height: u32,
-    #[serde(default = "default_icon_size")]
-    pub icon_size: u32,
-    #[serde(default = "default_border_width")]
-    pub border_width: u32,
+    /// Where to place the popup: "center" or "x,y".
     #[serde(default = "default_position")]
     pub position: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ColorsConfig {
-    #[serde(default = "default_bg")]
-    pub background: String,
-    #[serde(default = "default_bg_alpha")]
-    pub bg_alpha: f64,
-    #[serde(default = "default_fg")]
-    pub foreground: String,
-    #[serde(default = "default_frame")]
-    pub frame: String,
-    #[serde(default = "default_inactive")]
-    pub inactive: String,
+    /// Width of the X11 border drawn around the outside of the popup (px). 0 = none.
+    #[serde(default)]
+    pub outer_border_width: u32,
+    /// Color of the outer X11 border. Accepts "#rrggbb" (opaque) or "#rrggbbaa".
     #[serde(default = "default_border")]
     pub border: String,
+    /// Background of the popup (the area tiles sit on: frame borders, gaps).
+    /// Use "#rrggbbaa" to control transparency, e.g. "#282a36ff" = fully opaque.
+    /// Default is "#00000000" (fully transparent — compositor shows through).
+    #[serde(default = "default_window_bg")]
+    pub background: String,
+    /// Apply compositor blur behind the entire popup window.
+    #[serde(default = "default_true")]
+    pub blur: bool,
+    /// Extra pixels of space between adjacent tiles (beyond the tile border).
+    #[serde(default)]
+    pub gap: u32,
+    /// Padding around the outside of the tile area (px).
+    /// Extends the window background on all four sides beyond the tiles.
+    #[serde(default)]
+    pub padding: u32,
+}
+
+/// Settings that apply to each individual tile.
+#[derive(Debug, Deserialize)]
+pub struct TileConfig {
+    #[serde(default = "default_tile_width")]
+    pub width: u32,
+    #[serde(default = "default_tile_height")]
+    pub height: u32,
+    #[serde(default = "default_icon_size")]
+    pub icon_size: u32,
+    /// Thickness of the border drawn around each tile (px).
+    #[serde(default = "default_border_width")]
+    pub border_width: u32,
+    /// Padding inside each tile between the tile edge and its content (icon + label).
+    #[serde(default)]
+    pub padding: u32,
+    /// Tile background color. Use "#rrggbbaa" to control transparency.
+    #[serde(default = "default_bg")]
+    pub background: String,
+    /// Text and icon placeholder color.
+    #[serde(default = "default_fg")]
+    pub foreground: String,
+    /// Border color for the selected tile.
+    #[serde(default = "default_frame")]
+    pub frame: String,
+    /// Border color for unselected tiles. Use "#rrggbbaa" for alpha, e.g. "#44475a00" = invisible.
+    #[serde(default = "default_inactive")]
+    pub inactive: String,
+    /// Apply compositor blur only behind each tile region (not the gaps between tiles).
+    /// Set window.blur = false and tile.blur = true for tile-only blur.
+    #[serde(default)]
+    pub blur: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,17 +81,6 @@ pub struct FontConfig {
     pub name: String,
     #[serde(default = "default_font_size")]
     pub size: u32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BlurConfig {
-    #[serde(default = "default_blur_enabled")]
-    pub enabled: bool,
-    /// Blur radius hint passed to the compositor via _KDE_NET_WM_BLUR_BEHIND_REGION.
-    /// Actual blur appearance is controlled by picom's blur settings;
-    /// setting this to 0 disables the blur hint entirely.
-    #[serde(default = "default_blur_radius")]
-    pub radius: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,24 +97,23 @@ pub struct KeysConfig {
 
 // -- defaults --
 
+fn default_true() -> bool { true }
+
+fn default_position() -> String { "center".into() }
+fn default_window_bg() -> String { "#00000000".into() }  // fully transparent
+fn default_border() -> String { "#6272a4ff".into() }
+
 fn default_tile_width() -> u32 { 200 }
 fn default_tile_height() -> u32 { 150 }
 fn default_icon_size() -> u32 { 64 }
 fn default_border_width() -> u32 { 4 }
-fn default_position() -> String { "center".into() }
-
-fn default_bg() -> String { "#282a36".into() }
-fn default_bg_alpha() -> f64 { 0.80 }
-fn default_fg() -> String { "#f8f8f2".into() }
-fn default_frame() -> String { "#bd93f9".into() }
-fn default_inactive() -> String { "#44475a".into() }
-fn default_border() -> String { "#6272a4".into() }
+fn default_bg() -> String { "#282a36cc".into() }  // 0xcc = ~80% opaque
+fn default_fg() -> String { "#f8f8f2ff".into() }
+fn default_frame() -> String { "#bd93f9ff".into() }
+fn default_inactive() -> String { "#44475aff".into() }
 
 fn default_font_name() -> String { "sans".into() }
 fn default_font_size() -> u32 { 11 }
-
-fn default_blur_enabled() -> bool { true }
-fn default_blur_radius() -> u32 { 10 }
 
 fn default_modifier() -> String { "Alt".into() }
 fn default_next_key() -> String { "Tab".into() }
@@ -103,21 +121,15 @@ fn default_prev_key() -> String { "Shift+Tab".into() }
 fn default_cancel_key() -> String { "Escape".into() }
 
 impl Default for Config {
-    fn default() -> Self {
-        toml::from_str("").unwrap()
-    }
+    fn default() -> Self { toml::from_str("").unwrap() }
 }
-
 impl Default for WindowConfig {
     fn default() -> Self { toml::from_str("").unwrap() }
 }
-impl Default for ColorsConfig {
+impl Default for TileConfig {
     fn default() -> Self { toml::from_str("").unwrap() }
 }
 impl Default for FontConfig {
-    fn default() -> Self { toml::from_str("").unwrap() }
-}
-impl Default for BlurConfig {
     fn default() -> Self { toml::from_str("").unwrap() }
 }
 impl Default for KeysConfig {
@@ -147,29 +159,36 @@ impl Config {
         path.exists().then_some(path)
     }
 
-    /// Parse a hex color string like "#rrggbb" into (r, g, b) bytes.
-    pub fn parse_color(hex: &str) -> Option<(u8, u8, u8)> {
-        let h = hex.trim_start_matches('#');
-        if h.len() != 6 {
-            return None;
-        }
-        let r = u8::from_str_radix(&h[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&h[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&h[4..6], 16).ok()?;
-        Some((r, g, b))
+    /// Returns the popup window background as a packed 0xAARRGGBB value.
+    pub fn window_bg_argb(&self) -> u32 {
+        Self::color_argb(&self.window.background)
     }
 
-    /// Returns the background as a premultiplied ARGB u32 pixel value.
+    /// Returns the tile background as a packed 0xAARRGGBB value.
     pub fn bg_argb(&self) -> u32 {
-        let (r, g, b) = Self::parse_color(&self.colors.background)
-            .unwrap_or((0x28, 0x2a, 0x36));
-        let a = (self.colors.bg_alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
-        (a << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        Self::color_argb(&self.tile.background)
     }
 
-    /// Returns a fully opaque ARGB pixel for the given hex color.
+    /// Parse any color string into a packed 0xAARRGGBB value.
+    /// Accepts "#rrggbb" (fully opaque) or "#rrggbbaa" (with explicit alpha).
+    /// Any other format falls back to opaque black.
     pub fn color_argb(hex: &str) -> u32 {
-        let (r, g, b) = Self::parse_color(hex).unwrap_or((0, 0, 0));
-        0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        let h = hex.trim_start_matches('#');
+        match h.len() {
+            8 => {
+                let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0);
+                let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0);
+                let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0);
+                let a = u8::from_str_radix(&h[6..8], 16).unwrap_or(0xff);
+                ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+            }
+            6 => {
+                let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0);
+                let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0);
+                let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0);
+                0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+            }
+            _ => 0xFF000000,
+        }
     }
 }
