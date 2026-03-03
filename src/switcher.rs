@@ -332,10 +332,11 @@ impl<'a> Switcher<'a> {
         let fw = self.frame_w() as u16;
         let fw32 = self.frame_w();
         let br = self.border_radius();
+        let win_br = self.config.window.border_radius;
         let (n_cols, _) = self.grid_layout();
 
         // Find A8 alpha-only render format needed for rounded corner masks.
-        let a8_fmt = if br > 0 {
+        let a8_fmt = if br > 0 || win_br > 0 {
             match find_a8_format(&formats) {
                 Some(f) => f,
                 None => {
@@ -443,14 +444,52 @@ impl<'a> Switcher<'a> {
         // Blit the completed pixmap to the window in one atomic operation.
         let win_pic = self.conn.generate_id()?;
         self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?.check()?;
-        self.conn.render_composite(
-            PictOp::SRC,
-            pix_pic, 0u32, win_pic,
-            0, 0,   // src x, y
-            0, 0,   // mask x, y
-            0, 0,   // dst x, y
-            pw, ph,
-        )?.check()?;
+
+        if win_br > 0 && a8_fmt != 0 {
+            // Clear the window to transparent so corners show compositor content.
+            self.conn.render_fill_rectangles(
+                PictOp::SRC, win_pic,
+                RenderColor { red: 0, green: 0, blue: 0, alpha: 0 },
+                &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
+            )?.check()?;
+
+            // Build a full-popup A8 rounded-rect mask.
+            let mask_pix = self.conn.generate_id()?;
+            self.conn.create_pixmap(8, mask_pix, win, pw, ph)?.check()?;
+            let gc = self.conn.generate_id()?;
+            self.conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
+            self.conn.poly_fill_rectangle(mask_pix, gc,
+                &[Rectangle { x: 0, y: 0, width: pw, height: ph }])?.check()?;
+            self.conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+            let clamped_r = win_br.min(pw as u32 / 2).min(ph as u32 / 2);
+            fill_rounded_rect_to_gc(self.conn, mask_pix, gc, 0, 0, pw, ph, clamped_r)?;
+            self.conn.free_gc(gc)?.check()?;
+
+            let mask_pic = self.conn.generate_id()?;
+            self.conn.render_create_picture(mask_pic, mask_pix, a8_fmt,
+                &CreatePictureAux::new())?.check()?;
+            self.conn.free_pixmap(mask_pix)?.check()?;
+
+            self.conn.render_composite(
+                PictOp::OVER,
+                pix_pic, mask_pic, win_pic,
+                0, 0,   // src x, y
+                0, 0,   // mask x, y
+                0, 0,   // dst x, y
+                pw, ph,
+            )?.check()?;
+
+            self.conn.render_free_picture(mask_pic)?.check()?;
+        } else {
+            self.conn.render_composite(
+                PictOp::SRC,
+                pix_pic, 0u32, win_pic,
+                0, 0,   // src x, y
+                0, 0,   // mask x, y
+                0, 0,   // dst x, y
+                pw, ph,
+            )?.check()?;
+        }
 
         self.conn.render_free_picture(win_pic)?.check()?;
         self.conn.render_free_picture(pix_pic)?.check()?;

@@ -66,6 +66,11 @@ pub struct WindowConfig {
     /// picom's rounded-corners-exclude list. Default: false (no rounded corners).
     #[serde(default)]
     pub corners: bool,
+    /// Corner radius for the popup window background (px). 0 = square corners.
+    /// Clips the XRender framebuffer to a rounded shape so compositor transparency
+    /// shows through at the corners.
+    #[serde(default)]
+    pub border_radius: u32,
 }
 
 /// Settings that apply to each individual tile.
