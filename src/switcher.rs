@@ -7,7 +7,7 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt,
     Color as RenderColor,
-    PictOp, PictType, CreatePictureAux, Transform, Pointfix,
+    PictOp, PictType, CreatePictureAux, Transform, Pointfix, Repeat,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -130,6 +130,7 @@ impl<'a> Switcher<'a> {
     fn gap_w(&self) -> u32 { self.config.window.gap }
     fn tile_pad(&self) -> u32 { self.config.tile.padding }
     fn win_pad(&self) -> u32 { self.config.window.padding }
+    fn border_radius(&self) -> u32 { self.config.tile.border_radius }
 
     /// Compute how many columns (and resulting rows) fit without the popup
     /// getting within SCREEN_MARGIN pixels of the screen edges.
@@ -329,30 +330,68 @@ impl<'a> Switcher<'a> {
         }
 
         let fw = self.frame_w() as u16;
+        let fw32 = self.frame_w();
+        let br = self.border_radius();
         let (n_cols, _) = self.grid_layout();
+
+        // Find A8 alpha-only render format needed for rounded corner masks.
+        let a8_fmt = if br > 0 {
+            match find_a8_format(&formats) {
+                Some(f) => f,
+                None => {
+                    eprintln!("hop: no A8 render format found; border_radius ignored");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        let use_rounded = br > 0 && a8_fmt != 0;
+
         for (i, entry) in self.windows.iter().enumerate() {
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
+            let border_argb = if i == self.selected { frame_argb } else { inact_argb };
 
-            // Tile background — OVER composites on top of the window background.
-            let (ar, ag, ab, aa) = argb_to_render_color(bg_argb);
-            self.conn.render_fill_rectangles(
-                PictOp::OVER, pix_pic,
-                RenderColor { red: ar, green: ag, blue: ab, alpha: aa },
-                &[Rectangle { x: tile_x, y: tile_y, width: tw as u16, height: th as u16 }],
-            )?.check()?;
+            if use_rounded {
+                // `border_radius` is the outer corner radius (CSS semantics).
+                // Draw bg and border into non-overlapping areas so neither bleeds
+                // into the other's region and corner pixels are handled correctly.
+                let outer_r = br.min((tw + 2*fw32) / 2).min((th + 2*fw32) / 2);
+                let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
+                // Tile background: inner rounded rect, composited OVER window bg.
+                draw_filled_rounded_rect(
+                    self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                    tile_x, tile_y, tw, th, inner_r, bg_argb,
+                )?;
+                // Border ring: outer shape minus inner shape, so it only covers
+                // the fw-wide ring and never overwrites the bg or icon area.
+                draw_border_ring(
+                    self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                    tile_x - fw as i16, tile_y - fw as i16,
+                    tw + 2*fw32, th + 2*fw32,
+                    outer_r, fw32, inner_r, border_argb,
+                )?;
+            } else {
+                // Tile background — OVER composites on top of the window background.
+                let (ar, ag, ab, aa) = argb_to_render_color(bg_argb);
+                self.conn.render_fill_rectangles(
+                    PictOp::OVER, pix_pic,
+                    RenderColor { red: ar, green: ag, blue: ab, alpha: aa },
+                    &[Rectangle { x: tile_x, y: tile_y, width: tw as u16, height: th as u16 }],
+                )?.check()?;
 
-            // Frame (selected = frame color, others = inactive)
-            let frame_color = if i == self.selected { frame_argb } else { inact_argb };
-            let (fr, fg_c, fb, fa) = argb_to_render_color(frame_color);
-            self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
-                RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
-                &[
-                    Rectangle { x: tile_x, y: tile_y - fw as i16, width: tw as u16, height: fw },
-                    Rectangle { x: tile_x, y: tile_y + th as i16, width: tw as u16, height: fw },
-                    Rectangle { x: tile_x - fw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
-                    Rectangle { x: tile_x + tw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
-                ],
-            )?.check()?;
+                // Frame (selected = frame color, others = inactive)
+                let (fr, fg_c, fb, fa) = argb_to_render_color(border_argb);
+                self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
+                    RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
+                    &[
+                        Rectangle { x: tile_x, y: tile_y - fw as i16, width: tw as u16, height: fw },
+                        Rectangle { x: tile_x, y: tile_y + th as i16, width: tw as u16, height: fw },
+                        Rectangle { x: tile_x - fw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
+                        Rectangle { x: tile_x + tw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
+                    ],
+                )?.check()?;
+            }
 
             // Icon
             self.draw_icon(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
@@ -361,16 +400,29 @@ impl<'a> Switcher<'a> {
         // Redraw the selected tile's frame on top so it's never occluded by an
         // adjacent tile's border (left/right borders share the same X coordinate).
         let (sel_x, sel_y) = self.tile_pos(self.selected, n_cols);
-        let (fr, fg_c, fb, fa) = argb_to_render_color(frame_argb);
-        self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
-            RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
-            &[
-                Rectangle { x: sel_x,              y: sel_y - fw as i16,  width: tw as u16,      height: fw },
-                Rectangle { x: sel_x,              y: sel_y + th as i16,  width: tw as u16,      height: fw },
-                Rectangle { x: sel_x - fw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
-                Rectangle { x: sel_x + tw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
-            ],
-        )?.check()?;
+        if use_rounded {
+            // Only the border ring needs to be redrawn — it never touches the
+            // inner bg or icon area, so those don't need to be repainted.
+            let outer_r = br.min((tw + 2*fw32) / 2).min((th + 2*fw32) / 2);
+            let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
+            draw_border_ring(
+                self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                sel_x - fw as i16, sel_y - fw as i16,
+                tw + 2*fw32, th + 2*fw32,
+                outer_r, fw32, inner_r, frame_argb,
+            )?;
+        } else {
+            let (fr, fg_c, fb, fa) = argb_to_render_color(frame_argb);
+            self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
+                RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
+                &[
+                    Rectangle { x: sel_x,              y: sel_y - fw as i16,  width: tw as u16,      height: fw },
+                    Rectangle { x: sel_x,              y: sel_y + th as i16,  width: tw as u16,      height: fw },
+                    Rectangle { x: sel_x - fw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
+                    Rectangle { x: sel_x + tw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
+                ],
+            )?.check()?;
+        }
 
         // Flush x11rb so all XRender work is committed to the pixmap before
         // Xft draws on the same drawable via the separate Xlib connection.
@@ -576,22 +628,25 @@ impl<'a> Switcher<'a> {
         let lines: Vec<String> = lines.into_iter().take(max_lines).collect();
 
         // Allocate Xft color from fg_argb
-        let a = ((fg_argb >> 24) & 0xFF) as u16;
-        let r = ((fg_argb >> 16) & 0xFF) as u16;
-        let g = ((fg_argb >>  8) & 0xFF) as u16;
-        let b = ( fg_argb        & 0xFF) as u16;
-        let render_color = XRenderColor {
-            red:   r * 0x101,
-            green: g * 0x101,
-            blue:  b * 0x101,
-            alpha: a * 0x101,
+        let argb_to_xrender = |argb: u32| -> XRenderColor {
+            let a = ((argb >> 24) & 0xFF) as u16;
+            let r = ((argb >> 16) & 0xFF) as u16;
+            let g = ((argb >>  8) & 0xFF) as u16;
+            let b = ( argb        & 0xFF) as u16;
+            XRenderColor { red: r * 0x101, green: g * 0x101, blue: b * 0x101, alpha: a * 0x101 }
         };
+
+        let fg_rc = argb_to_xrender(fg_argb);
         let mut xft_color: xft::XftColor = unsafe { std::mem::zeroed() };
-        unsafe {
-            xft::XftColorAllocValue(
-                xst.display, xst.visual, xst.colormap,
-                &render_color, &mut xft_color,
-            );
+        unsafe { xft::XftColorAllocValue(xst.display, xst.visual, xst.colormap, &fg_rc, &mut xft_color); }
+
+        // Optionally allocate a shadow color.
+        let has_shadow = self.config.font.shadow;
+        let mut shadow_color: xft::XftColor = unsafe { std::mem::zeroed() };
+        if has_shadow {
+            let shadow_argb = resolve_shadow_color(&self.config.font.shadow_color, fg_argb);
+            let shadow_rc = argb_to_xrender(shadow_argb);
+            unsafe { xft::XftColorAllocValue(xst.display, xst.visual, xst.colormap, &shadow_rc, &mut shadow_color); }
         }
 
         let draw = unsafe {
@@ -614,6 +669,18 @@ impl<'a> Switcher<'a> {
             let x = tile_x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
             let y = label_top + ascent + (i as u32 * line_h) as i16;
 
+            // Shadow pass (drawn first so it appears behind the main text).
+            if has_shadow {
+                let off = self.config.font.shadow_offset as i16;
+                unsafe {
+                    xft::XftDrawStringUtf8(
+                        draw, &shadow_color, font,
+                        (x + off) as i32, (y + off) as i32,
+                        text.as_ptr(), text.len() as i32,
+                    );
+                }
+            }
+
             unsafe {
                 xft::XftDrawStringUtf8(
                     draw, &xft_color, font,
@@ -625,6 +692,9 @@ impl<'a> Switcher<'a> {
 
         unsafe {
             xft::XftDrawDestroy(draw);
+            if has_shadow {
+                xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut shadow_color);
+            }
             xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut xft_color);
             xft::XftFontClose(xst.display, font);
             x11::xlib::XFlush(xst.display);
@@ -670,6 +740,16 @@ impl<'a> Switcher<'a> {
 
         let mut items = vec![title_bytes.len() as u8, 0u8];
         items.extend_from_slice(title_bytes);
+
+        // Shadow pass.
+        if self.config.font.shadow {
+            let shadow_argb = resolve_shadow_color(&self.config.font.shadow_color, fg_argb);
+            let off = self.config.font.shadow_offset as i16;
+            self.conn.change_gc(gc, &ChangeGCAux::new().foreground(shadow_argb))?.check()?;
+            self.conn.poly_text8(win, gc, label_x + off, label_y + off, &items)?.check()?;
+            self.conn.change_gc(gc, &ChangeGCAux::new().foreground(fg_argb))?.check()?;
+        }
+
         self.conn.poly_text8(win, gc, label_x, label_y, &items)?.check()?;
 
         self.conn.free_gc(gc)?.check()?;
@@ -1044,6 +1124,225 @@ fn wrap_text_xft(
     }
 
     lines
+}
+
+/// Compute an appropriate shadow color for `fg_argb` using WCAG 2.1 relative luminance.
+///
+/// Returns a dark shadow (0xCC000000, ~80% opaque black) when the foreground is light,
+/// or a light shadow (0xCCFFFFFF, ~80% opaque white) when the foreground is dark.
+/// The crossover threshold (~0.179) is the luminance at which contrast against black
+/// equals contrast against white.
+fn wcag_shadow_argb(fg_argb: u32) -> u32 {
+    let linearize = |c_u8: u8| -> f64 {
+        let c = c_u8 as f64 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let r = linearize(((fg_argb >> 16) & 0xFF) as u8);
+    let g = linearize(((fg_argb >>  8) & 0xFF) as u8);
+    let b = linearize(( fg_argb        & 0xFF) as u8);
+    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if lum > 0.179 {
+        0xCC000000 // light fg → dark shadow
+    } else {
+        0xCCFFFFFF // dark fg → light shadow
+    }
+}
+
+/// Resolve the shadow color string from config.
+/// If `shadow_color_str` is `"auto"`, picks a shadow color based on WCAG luminance of `fg_argb`.
+/// Otherwise parses the hex value directly via `Config::color_argb`.
+fn resolve_shadow_color(shadow_color_str: &str, fg_argb: u32) -> u32 {
+    if shadow_color_str == "auto" {
+        wcag_shadow_argb(fg_argb)
+    } else {
+        Config::color_argb(shadow_color_str)
+    }
+}
+
+/// Find the XRender A8 (8-bit alpha-only) picture format.
+fn find_a8_format(formats: &x11rb::protocol::render::QueryPictFormatsReply) -> Option<u32> {
+    formats.formats.iter()
+        .find(|f| {
+            f.depth == 8
+                && f.type_ == PictType::DIRECT
+                && f.direct.alpha_mask == 0xFF
+                && f.direct.red_mask == 0
+                && f.direct.green_mask == 0
+                && f.direct.blue_mask == 0
+        })
+        .map(|f| f.id)
+}
+
+/// Draw a filled rounded rectangle shape into a pixmap using a GC.
+/// The GC's current foreground pixel value is used for the fill.
+/// Painting order: three rectangles for the interior cross, four filled arcs for corners.
+fn fill_rounded_rect_to_gc(
+    conn: &RustConnection,
+    pix: u32,
+    gc: u32,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    radius: u32,
+) -> Result<(), Box<dyn Error>> {
+    let r = (radius as u16).min(w / 2).min(h / 2);
+    if r == 0 {
+        conn.poly_fill_rectangle(pix, gc, &[Rectangle { x, y, width: w, height: h }])?.check()?;
+        return Ok(());
+    }
+    let r2 = r * 2;
+    conn.poly_fill_rectangle(pix, gc, &[
+        Rectangle { x: x + r as i16,           y,               width: w - r2, height: h      },
+        Rectangle { x,                          y: y + r as i16, width: r,      height: h - r2 },
+        Rectangle { x: x + (w - r) as i16,     y: y + r as i16, width: r,      height: h - r2 },
+    ])?.check()?;
+    conn.poly_fill_arc(pix, gc, &[
+        Arc { x,                     y,                     width: r2, height: r2, angle1: 90*64,  angle2: 90*64 }, // top-left
+        Arc { x: x+(w-r2) as i16,   y,                     width: r2, height: r2, angle1: 0,      angle2: 90*64 }, // top-right
+        Arc { x: x+(w-r2) as i16,   y: y+(h-r2) as i16,   width: r2, height: r2, angle1: 17280,  angle2: 90*64 }, // bottom-right (270*64)
+        Arc { x,                     y: y+(h-r2) as i16,   width: r2, height: r2, angle1: 180*64, angle2: 90*64 }, // bottom-left
+    ])?.check()?;
+    Ok(())
+}
+
+/// Composite a solid color through an A8 rounded-rect mask onto `dst_pic` (OVER).
+///
+/// When `radius == 0` falls back to a plain `render_fill_rectangles` call.
+fn draw_filled_rounded_rect(
+    conn: &RustConnection,
+    dst_pic: u32,
+    argb_fmt: u32,
+    a8_fmt: u32,
+    drawable: u32,
+    x: i16,
+    y: i16,
+    w: u32,
+    h: u32,
+    radius: u32,
+    color_argb: u32,
+) -> Result<(), Box<dyn Error>> {
+    if w == 0 || h == 0 { return Ok(()); }
+    let wu = w as u16;
+    let hu = h as u16;
+
+    if radius == 0 {
+        let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
+        conn.render_fill_rectangles(
+            PictOp::OVER, dst_pic,
+            RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
+            &[Rectangle { x, y, width: wu, height: hu }],
+        )?.check()?;
+        return Ok(());
+    }
+
+    let mask_pix = conn.generate_id()?;
+    conn.create_pixmap(8, mask_pix, drawable, wu, hu)?.check()?;
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
+    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?.check()?;
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+    fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, wu, hu, radius)?;
+    conn.free_gc(gc)?.check()?;
+
+    composite_color_through_mask(conn, dst_pic, argb_fmt, a8_fmt, drawable, x, y, wu, hu, mask_pix, color_argb)?;
+    conn.free_pixmap(mask_pix)?.check()?;
+    Ok(())
+}
+
+/// Composite a solid color through a ring-shaped A8 mask onto `dst_pic` (OVER).
+///
+/// The ring = outer rounded rect minus the inner rounded rect punched out.
+/// `(ox, oy, ow, oh)` is the outer rect; the inner rect is inset by `fw` on all sides.
+/// `outer_r` is the corner radius of the outer edge; `inner_r` for the inner edge
+/// (typically `outer_r - fw`, or 0 when `outer_r <= fw`).
+fn draw_border_ring(
+    conn: &RustConnection,
+    dst_pic: u32,
+    argb_fmt: u32,
+    a8_fmt: u32,
+    drawable: u32,
+    ox: i16,
+    oy: i16,
+    ow: u32,
+    oh: u32,
+    outer_r: u32,
+    fw: u32,
+    inner_r: u32,
+    color_argb: u32,
+) -> Result<(), Box<dyn Error>> {
+    if ow == 0 || oh == 0 { return Ok(()); }
+    let owu = ow as u16;
+    let ohu = oh as u16;
+
+    let mask_pix = conn.generate_id()?;
+    conn.create_pixmap(8, mask_pix, drawable, owu, ohu)?.check()?;
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
+    // Clear mask to 0.
+    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?.check()?;
+    // Paint outer rounded rect with 255.
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+    fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, owu, ohu, outer_r)?;
+    // Punch out inner rounded rect with 0.
+    let iw = ow.saturating_sub(2 * fw) as u16;
+    let ih = oh.saturating_sub(2 * fw) as u16;
+    if iw > 0 && ih > 0 {
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(0u32))?.check()?;
+        fill_rounded_rect_to_gc(conn, mask_pix, gc, fw as i16, fw as i16, iw, ih, inner_r)?;
+    }
+    conn.free_gc(gc)?.check()?;
+
+    composite_color_through_mask(conn, dst_pic, argb_fmt, a8_fmt, drawable, ox, oy, owu, ohu, mask_pix, color_argb)?;
+    conn.free_pixmap(mask_pix)?.check()?;
+    Ok(())
+}
+
+/// Composite `color_argb` through an existing A8 `mask_pix` onto `dst_pic` using OVER.
+/// Creates a temporary 1×1 repeated source and frees it afterwards.
+/// Does NOT free `mask_pix` — the caller is responsible for that.
+fn composite_color_through_mask(
+    conn: &RustConnection,
+    dst_pic: u32,
+    argb_fmt: u32,
+    a8_fmt: u32,
+    drawable: u32,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    mask_pix: u32,
+    color_argb: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mask_pic = conn.generate_id()?;
+    conn.render_create_picture(mask_pic, mask_pix, a8_fmt, &CreatePictureAux::new())?.check()?;
+
+    let src_pix = conn.generate_id()?;
+    conn.create_pixmap(32, src_pix, drawable, 1, 1)?.check()?;
+    let src_pic = conn.generate_id()?;
+    conn.render_create_picture(src_pic, src_pix, argb_fmt,
+        &CreatePictureAux::new().repeat(Repeat::NORMAL))?.check()?;
+    conn.free_pixmap(src_pix)?.check()?;
+
+    let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
+    conn.render_fill_rectangles(
+        PictOp::SRC, src_pic,
+        RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
+        &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
+    )?.check()?;
+
+    conn.render_composite(
+        PictOp::OVER,
+        src_pic, mask_pic, dst_pic,
+        0, 0,  // src x, y  (1×1 with repeat)
+        0, 0,  // mask x, y
+        x, y,  // dst x, y
+        w, h,
+    )?.check()?;
+
+    conn.render_free_picture(src_pic)?.check()?;
+    conn.render_free_picture(mask_pic)?.check()?;
+    Ok(())
 }
 
 /// Convert a packed 0xAARRGGBB u32 into XRender color components (0–0xFFFF each).

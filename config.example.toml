@@ -40,8 +40,9 @@ corners            = false
 width        = 200
 height       = 150
 icon_size    = 64
-border_width = 4    # tile frame thickness (px)
-padding      = 0    # pixels of padding inside each tile around content (icon + label)
+border_width   = 4    # tile frame thickness (px)
+border_radius  = 0    # corner radius for tile borders (px); 0 = square corners
+padding        = 0    # pixels of padding inside each tile around content (icon + label)
 background   = "#282a36cc"  # cc ≈ 80% opaque; use "ff" for solid, "00" for transparent
 foreground   = "#f8f8f2ff"  # text and icon placeholder color
 frame        = "#bd93f9ff"  # selected tile border
@@ -51,8 +52,14 @@ inactive     = "#44475aff"  # unselected tile border; "00" alpha = invisible bor
 blur         = false
 
 [font]
-name = "Roboto"
-size = 11
+name          = "Roboto"
+size          = 11
+# Drop shadow behind tile labels — helps readability on light tile backgrounds.
+shadow        = false
+# shadow_color: "auto" picks black or white based on WCAG contrast of the text color.
+# Override with an explicit "#rrggbbaa" value if you prefer a specific shadow color.
+shadow_color  = "auto"
+shadow_offset = 1            # offset in pixels
 
 [keys]
 modifier = "Alt"

@@ -99,6 +99,9 @@ pub struct TileConfig {
     /// Set window.blur = false and tile.blur = true for tile-only blur.
     #[serde(default)]
     pub blur: bool,
+    /// Corner radius for tile borders (px). 0 = square corners.
+    #[serde(default)]
+    pub border_radius: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +110,15 @@ pub struct FontConfig {
     pub name: String,
     #[serde(default = "default_font_size")]
     pub size: u32,
+    /// Draw a drop shadow behind tile labels. Helps readability on light tile backgrounds.
+    #[serde(default)]
+    pub shadow: bool,
+    /// Shadow color. Only used when shadow = true.
+    #[serde(default = "default_text_shadow_color")]
+    pub shadow_color: String,
+    /// Shadow offset in pixels. Only used when shadow = true.
+    #[serde(default = "default_text_shadow_offset")]
+    pub shadow_offset: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +158,8 @@ fn default_blur_strength() -> u32 { 5 }
 
 fn default_font_name() -> String { "sans".into() }
 fn default_font_size() -> u32 { 11 }
+fn default_text_shadow_color() -> String { "auto".into() }
+fn default_text_shadow_offset() -> u32 { 1 }
 
 fn default_modifier() -> String { "Alt".into() }
 fn default_next_key() -> String { "Tab".into() }
