@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     eprintln!("hop: listening for {}+{}...", config.keys.modifier, config.keys.next);
 
-    let mut switcher = Switcher::new(&display.conn, &config, &display)?;
+    let mut switcher = Switcher::new(&display.conn, config, &display)?;
     let root = display.root;
 
     loop {

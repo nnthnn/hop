@@ -28,7 +28,7 @@ pub struct WindowEntry {
 
 pub struct Switcher<'a> {
     conn: &'a RustConnection,
-    config: &'a Config,
+    config: Config,
     pub windows: Vec<WindowEntry>,
     pub selected: usize,
     popup: Option<Window>,
@@ -42,7 +42,7 @@ pub struct Switcher<'a> {
 impl<'a> Switcher<'a> {
     pub fn new(
         conn: &'a RustConnection,
-        config: &'a Config,
+        config: Config,
         display: &crate::x11::Display,
     ) -> Result<Self, Box<dyn Error>> {
         let (visual_id, colormap) = match (display.argb_visual, display.argb_colormap) {
@@ -107,6 +107,10 @@ impl<'a> Switcher<'a> {
     pub fn show(&mut self, root: Window, backward: bool) -> Result<(), Box<dyn Error>> {
         if self.popup.is_some() {
             return Ok(());
+        }
+        // Reload config on every popup open so edits take effect without restarting.
+        if let Ok(fresh) = Config::load() {
+            self.config = fresh;
         }
         self.load_windows(root)?;
         if self.windows.is_empty() {
