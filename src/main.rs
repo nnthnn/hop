@@ -15,6 +15,7 @@ use switcher::Switcher;
 const XK_RETURN: u32 = 0xff0d;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let debug = std::env::var("HOP_DEBUG").is_ok();
     let config = Config::load()?;
     maybe_configure_picom(&config);
     let display = Display::connect()?;
@@ -93,7 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             Event::Expose(ev) => {
                 if switcher.popup_window() == Some(ev.window) {
-                    switcher.redraw()?;
+                    if debug { eprintln!("[hop] Expose count={}", ev.count); }
+                    switcher.repaint()?;
                 }
             }
 
@@ -356,18 +358,19 @@ fn set_picom_setting(content: &mut String, key: &str, value: &str) -> bool {
     true
 }
 
-/// Translate a keycode + modifier state into a keysym.
+/// Translate a keycode into an unshifted keysym.
+/// We always use column 0 (unshifted) because modifier state is tracked
+/// separately via ev.state bitmasks. Using the shifted column causes
+/// Shift+Tab to return ISO_Left_Tab (0xfe20) instead of Tab (0xff09),
+/// which breaks Alt+Shift+Tab reverse navigation.
 fn keycode_to_keysym(
     conn: &x11rb::rust_connection::RustConnection,
     keycode: u8,
-    state: KeyButMask,
+    _state: KeyButMask,
 ) -> Result<u32, Box<dyn Error>> {
     let mapping = conn.get_keyboard_mapping(keycode, 1)?.reply()?;
-    let kpk = mapping.keysyms_per_keycode as usize;
     if mapping.keysyms.is_empty() {
         return Ok(0);
     }
-    let shift = u32::from(state) & u32::from(ModMask::SHIFT) != 0;
-    let col = usize::from(shift && kpk > 1);
-    Ok(mapping.keysyms[col])
+    Ok(mapping.keysyms[0])
 }

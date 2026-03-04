@@ -37,6 +37,19 @@ pub struct Switcher<'a> {
     screen_w: u16,
     screen_h: u16,
     xft: Option<xh::XftState>,
+    /// Persistent off-screen buffer kept alive for the whole popup session.
+    /// Reusing the same pixmap avoids allocation overhead and prevents picom
+    /// from seeing rapid pixmap churn (which causes visible flicker).
+    pix_buf: Option<(u32, u32, u16, u16)>,  // (pixmap xid, pix_pic xid, pw, ph)
+    /// Cached A8 mask picture for the window rounded-corner clip (built once per show()).
+    /// Reused by every blit so we never rebuild it mid-navigation.
+    win_mask_pic: Option<u32>,
+    cached_argb_fmt: u32,
+    cached_a8_fmt: u32,
+    /// window_bg_argb at last full redraw; used to restore border areas cheaply.
+    cached_win_bg: u32,
+    /// Verbose event tracing; enabled by HOP_DEBUG env var.
+    debug: bool,
 }
 
 impl<'a> Switcher<'a> {
@@ -69,6 +82,12 @@ impl<'a> Switcher<'a> {
             screen_w: display.screen_width,
             screen_h: display.screen_height,
             xft,
+            pix_buf: None,
+            win_mask_pic: None,
+            cached_argb_fmt: 0,
+            cached_a8_fmt: 0,
+            cached_win_bg: 0,
+            debug: std::env::var("HOP_DEBUG").is_ok(),
         })
     }
 
@@ -124,6 +143,7 @@ impl<'a> Switcher<'a> {
         }
 
         self.create_popup()?;
+        if self.debug { eprintln!("[hop] show(): {} windows, selected={}", self.windows.len(), self.selected); }
         self.redraw()?;
         Ok(())
     }
@@ -274,14 +294,16 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
-    /// Redraw all tiles using XRender for ARGB compositing.
-    /// Uses double buffering: everything is rendered to an off-screen pixmap
-    /// first, then the completed frame is copied to the window in one shot.
-    pub fn redraw(&self) -> Result<(), Box<dyn Error>> {
+    /// Full redraw: renders all tiles, icons, and labels into the persistent
+    /// off-screen pixmap, then blits it to the window.  The pixmap is kept
+    /// alive across calls; it is only freed in `hide()`.
+    pub fn redraw(&mut self) -> Result<(), Box<dyn Error>> {
         let win = match self.popup {
             Some(w) => w,
             None => return Ok(()),
         };
+        let t0 = if self.debug { Some(std::time::Instant::now()) } else { None };
+        if self.debug { eprintln!("[hop] redraw() start (pix_buf={})", self.pix_buf.is_some()); }
 
         let window_bg_argb = self.config.window_bg_argb();
         let bg_argb = self.config.bg_argb();
@@ -292,7 +314,7 @@ impl<'a> Switcher<'a> {
         let tw = self.tile_w();
         let th = self.tile_h();
 
-        // Find ARGB32 render format
+        // Query render formats (needed on first draw; cheap thereafter).
         let formats = self.conn.render_query_pict_formats()?.reply()?;
         let argb_fmt = formats.formats.iter()
             .find(|f| f.depth == 32 && f.type_ == PictType::DIRECT
@@ -305,14 +327,72 @@ impl<'a> Switcher<'a> {
             return Ok(());
         };
 
+        self.cached_argb_fmt = fmt;
+        self.cached_win_bg   = window_bg_argb;
+
         let (_, _, pw, ph) = self.popup_dims();
+        let win_br = self.config.window.border_radius;
+        let br = self.border_radius();
 
-        // Off-screen pixmap: all rendering happens here, invisible to the user.
-        let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, win, pw, ph)?.check()?;
+        let a8_fmt = if br > 0 || win_br > 0 {
+            match find_a8_format(&formats) {
+                Some(f) => f,
+                None => {
+                    eprintln!("hop: no A8 render format found; border_radius ignored");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        self.cached_a8_fmt = a8_fmt;
 
-        let pix_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(pix_pic, pixmap, fmt, &CreatePictureAux::new())?.check()?;
+        // Reuse the persistent pixmap when dimensions match; recreate otherwise.
+        let pix_buf_fresh = match self.pix_buf {
+            Some((_, _, cpw, cph)) if cpw == pw && cph == ph => false,
+            _ => true,
+        };
+        let (pixmap, pix_pic) = match self.pix_buf {
+            Some((pix, pic, cpw, cph)) if cpw == pw && cph == ph => (pix, pic),
+            _ => {
+                if let Some((old_pix, old_pic, _, _)) = self.pix_buf.take() {
+                    self.conn.render_free_picture(old_pic)?.check()?;
+                    self.conn.free_pixmap(old_pix)?.check()?;
+                }
+                let pix = self.conn.generate_id()?;
+                self.conn.create_pixmap(32, pix, win, pw, ph)?.check()?;
+                let pic = self.conn.generate_id()?;
+                self.conn.render_create_picture(pic, pix, fmt, &CreatePictureAux::new())?.check()?;
+                self.pix_buf = Some((pix, pic, pw, ph));
+                (pix, pic)
+            }
+        };
+
+        // Build (or rebuild when popup size changes) the A8 window-corner mask.
+        // Kept alive for the whole session so blit_to_window() never rebuilds it
+        // mid-navigation — eliminating the pre-clear + OVER two-step flicker source.
+        if pix_buf_fresh || self.win_mask_pic.is_none() {
+            if let Some(old_mask) = self.win_mask_pic.take() {
+                self.conn.render_free_picture(old_mask)?.check()?;
+            }
+            if win_br > 0 && a8_fmt != 0 {
+                let mask_pix = self.conn.generate_id()?;
+                self.conn.create_pixmap(8, mask_pix, win, pw, ph)?.check()?;
+                let gc = self.conn.generate_id()?;
+                self.conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
+                self.conn.poly_fill_rectangle(mask_pix, gc,
+                    &[Rectangle { x: 0, y: 0, width: pw, height: ph }])?.check()?;
+                self.conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+                let clamped_r = win_br.min(pw as u32 / 2).min(ph as u32 / 2);
+                fill_rounded_rect_to_gc(self.conn, mask_pix, gc, 0, 0, pw, ph, clamped_r)?;
+                self.conn.free_gc(gc)?.check()?;
+                let mask_pic = self.conn.generate_id()?;
+                self.conn.render_create_picture(mask_pic, mask_pix, a8_fmt,
+                    &CreatePictureAux::new())?.check()?;
+                self.conn.free_pixmap(mask_pix)?.check()?;
+                self.win_mask_pic = Some(mask_pic);
+            }
+        }
 
         // Fill pixmap with the window background. Either a flat fill or a gradient.
         let gradient_mode = self.config.window.background_gradient.as_str();
@@ -335,22 +415,7 @@ impl<'a> Switcher<'a> {
 
         let fw = self.frame_w() as u16;
         let fw32 = self.frame_w();
-        let br = self.border_radius();
-        let win_br = self.config.window.border_radius;
         let (n_cols, _) = self.grid_layout();
-
-        // Find A8 alpha-only render format needed for rounded corner masks.
-        let a8_fmt = if br > 0 || win_br > 0 {
-            match find_a8_format(&formats) {
-                Some(f) => f,
-                None => {
-                    eprintln!("hop: no A8 render format found; border_radius ignored");
-                    0
-                }
-            }
-        } else {
-            0
-        };
         let use_rounded = br > 0 && a8_fmt != 0;
 
         for (i, entry) in self.windows.iter().enumerate() {
@@ -445,62 +510,141 @@ impl<'a> Switcher<'a> {
             unsafe { x11::xlib::XSync(xft.display, 0); }
         }
 
-        // Blit the completed pixmap to the window in one atomic operation.
+        if let Some(t) = t0 {
+            eprintln!("[hop] redraw() done in {:?} → blitting", t.elapsed());
+        }
+        self.blit_to_window()
+    }
+
+    /// Blit the persistent off-screen pixmap to the window in one atomic step.
+    /// Applies the window border-radius mask when configured.
+    fn blit_to_window(&self) -> Result<(), Box<dyn Error>> {
+        let win = match self.popup { Some(w) => w, None => return Ok(()) };
+        let (_, pix_pic, pw, ph) = match self.pix_buf { Some(b) => b, None => return Ok(()) };
+        let fmt = self.cached_argb_fmt;
+        let a8_fmt = self.cached_a8_fmt;
+        let win_br = self.config.window.border_radius;
+        if fmt == 0 { return Ok(()); }
+        if self.debug { eprintln!("[hop] blit_to_window() win_br={win_br}"); }
+
         let win_pic = self.conn.generate_id()?;
         self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?.check()?;
 
-        if win_br > 0 && a8_fmt != 0 {
-            // Clear the window to transparent so corners show compositor content.
-            self.conn.render_fill_rectangles(
-                PictOp::SRC, win_pic,
-                RenderColor { red: 0, green: 0, blue: 0, alpha: 0 },
-                &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
-            )?.check()?;
-
-            // Build a full-popup A8 rounded-rect mask.
-            let mask_pix = self.conn.generate_id()?;
-            self.conn.create_pixmap(8, mask_pix, win, pw, ph)?.check()?;
-            let gc = self.conn.generate_id()?;
-            self.conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
-            self.conn.poly_fill_rectangle(mask_pix, gc,
-                &[Rectangle { x: 0, y: 0, width: pw, height: ph }])?.check()?;
-            self.conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
-            let clamped_r = win_br.min(pw as u32 / 2).min(ph as u32 / 2);
-            fill_rounded_rect_to_gc(self.conn, mask_pix, gc, 0, 0, pw, ph, clamped_r)?;
-            self.conn.free_gc(gc)?.check()?;
-
-            let mask_pic = self.conn.generate_id()?;
-            self.conn.render_create_picture(mask_pic, mask_pix, a8_fmt,
-                &CreatePictureAux::new())?.check()?;
-            self.conn.free_pixmap(mask_pix)?.check()?;
-
-            self.conn.render_composite(
-                PictOp::OVER,
-                pix_pic, mask_pic, win_pic,
-                0, 0,   // src x, y
-                0, 0,   // mask x, y
-                0, 0,   // dst x, y
-                pw, ph,
-            )?.check()?;
-
-            self.conn.render_free_picture(mask_pic)?.check()?;
-        } else {
-            self.conn.render_composite(
-                PictOp::SRC,
-                pix_pic, 0u32, win_pic,
-                0, 0,   // src x, y
-                0, 0,   // mask x, y
-                0, 0,   // dst x, y
-                pw, ph,
-            )?.check()?;
-        }
+        // Use the cached mask (built once in redraw()) for a single atomic SRC blit.
+        // PictOp::SRC with mask: result = src * mask_alpha — corners (mask=0) become
+        // transparent in one operation with no intermediate transparent state that
+        // the compositor could sample, eliminating the pre-clear flicker.
+        let mask_pic = if win_br > 0 && a8_fmt != 0 { self.win_mask_pic.unwrap_or(0) } else { 0 };
+        self.conn.render_composite(
+            PictOp::SRC,
+            pix_pic, mask_pic, win_pic,
+            0, 0,   // src x, y
+            0, 0,   // mask x, y
+            0, 0,   // dst x, y
+            pw, ph,
+        )?.check()?;
 
         self.conn.render_free_picture(win_pic)?.check()?;
-        self.conn.render_free_picture(pix_pic)?.check()?;
-        self.conn.free_pixmap(pixmap)?.check()?;
         self.conn.flush()?;
-
         Ok(())
+    }
+
+    /// Partial redraw for selection changes: only repaints the two affected tile
+    /// borders (old → inactive, new → frame) on the persistent pixmap, then blits.
+    ///
+    /// This skips all icon and text rendering, making next()/prev() nearly instant.
+    /// For rounded borders with a flat background: SRC-erases the border rect area
+    /// with the cached window bg, then composites the rounded ring with draw_border_ring.
+    /// Only falls back to a full redraw when a gradient background is active (the
+    /// gradient pixels in the corner areas can't be cheaply restored).
+    fn border_redraw(&mut self, old_sel: usize) -> Result<(), Box<dyn Error>> {
+        if old_sel == self.selected {
+            return Ok(());
+        }
+        if self.debug {
+            eprintln!("[hop] border_redraw(old={old_sel} → new={})", self.selected);
+        }
+
+        let (pixmap, pix_pic, _, _) = match self.pix_buf {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let br        = self.border_radius();
+        let a8_fmt    = self.cached_a8_fmt;
+        let argb_fmt  = self.cached_argb_fmt;
+        let use_rings = br > 0 && a8_fmt != 0;
+
+        // Gradient corners can't be cheaply restored — fall back to full redraw.
+        if use_rings && self.config.window.background_gradient != "none" {
+            if self.debug { eprintln!("[hop] border_redraw: rounded+gradient → fallback full redraw"); }
+            return self.redraw();
+        }
+
+        let tw         = self.tile_w();
+        let th         = self.tile_h();
+        let fw32       = self.frame_w();
+        let fw         = fw32 as u16;
+        let frame_argb = Config::color_argb(&self.config.tile.frame);
+        let inact_argb = Config::color_argb(&self.config.tile.inactive);
+        let (n_cols, _) = self.grid_layout();
+
+        let (wbr, wbg, wbb, wba) = argb_to_render_color(self.cached_win_bg);
+        let win_bg = RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba };
+
+        for &(sel, border_argb) in &[(old_sel, inact_argb), (self.selected, frame_argb)] {
+            if sel >= self.windows.len() { continue; }
+            let (tile_x, tile_y) = self.tile_pos(sel, n_cols);
+            // The four non-overlapping rectangular strips that cover the border ring area.
+            let border_rects = [
+                Rectangle { x: tile_x,              y: tile_y - fw as i16, width: tw as u16, height: fw },
+                Rectangle { x: tile_x,              y: tile_y + th as i16, width: tw as u16, height: fw },
+                Rectangle { x: tile_x - fw as i16,  y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
+                Rectangle { x: tile_x + tw as i16,  y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
+            ];
+            // Erase the border strip area back to the flat window background.
+            self.conn.render_fill_rectangles(PictOp::SRC, pix_pic, win_bg, &border_rects)?.check()?;
+
+            if use_rings {
+                // Composite the rounded ring shape on top (same formula as redraw()).
+                let outer_r = br.min((tw + 2*fw32) / 2).min((th + 2*fw32) / 2);
+                let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
+
+                // draw_border_ring's inner punch-out uses rounded arcs. The square
+                // corner areas of each inner_r×inner_r corner box fall outside the
+                // arc and stay as mask=255 (ring pixels). Those pixels land inside
+                // the tile interior bounds, so the 4 border rects above don't erase
+                // them. Clear those ~inner_r×inner_r corner squares now so the old
+                // ring color doesn't bleed through as tiny artifacts.
+                if inner_r > 0 {
+                    let cr  = inner_r as u16;
+                    let cr16 = inner_r as i16;
+                    let tw16 = tw as i16;
+                    let th16 = th as i16;
+                    self.conn.render_fill_rectangles(PictOp::SRC, pix_pic, win_bg, &[
+                        Rectangle { x: tile_x,           y: tile_y,           width: cr, height: cr },
+                        Rectangle { x: tile_x+tw16-cr16, y: tile_y,           width: cr, height: cr },
+                        Rectangle { x: tile_x,           y: tile_y+th16-cr16, width: cr, height: cr },
+                        Rectangle { x: tile_x+tw16-cr16, y: tile_y+th16-cr16, width: cr, height: cr },
+                    ])?.check()?;
+                }
+
+                draw_border_ring(
+                    self.conn, pix_pic, argb_fmt, a8_fmt, pixmap,
+                    tile_x - fw as i16, tile_y - fw as i16,
+                    tw + 2*fw32, th + 2*fw32,
+                    outer_r, fw32, inner_r, border_argb,
+                )?;
+            } else {
+                // Flat border: fill the strips directly with the border color.
+                let (cr, cg, cb, ca) = argb_to_render_color(border_argb);
+                self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
+                    RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
+                    &border_rects)?.check()?;
+            }
+        }
+
+        self.blit_to_window()
     }
 
     fn draw_icon(
@@ -802,14 +946,18 @@ impl<'a> Switcher<'a> {
 
     pub fn next(&mut self) -> Result<(), Box<dyn Error>> {
         if self.windows.is_empty() { return Ok(()); }
+        let old = self.selected;
         self.selected = (self.selected + 1) % self.windows.len();
-        self.redraw()
+        if self.debug { eprintln!("[hop] next(): {old} → {}", self.selected); }
+        self.border_redraw(old)
     }
 
     pub fn prev(&mut self) -> Result<(), Box<dyn Error>> {
         if self.windows.is_empty() { return Ok(()); }
+        let old = self.selected;
         self.selected = self.selected.checked_sub(1).unwrap_or(self.windows.len() - 1);
-        self.redraw()
+        if self.debug { eprintln!("[hop] prev(): {old} → {}", self.selected); }
+        self.border_redraw(old)
     }
 
     /// Hide popup and switch to the selected window.
@@ -828,9 +976,20 @@ impl<'a> Switcher<'a> {
     }
 
     fn hide(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.debug { eprintln!("[hop] hide()"); }
         if let Some(win) = self.popup.take() {
             self.conn.ungrab_keyboard(0u32)?.check()?;
             self.conn.destroy_window(win)?.check()?;
+            // Free the persistent off-screen buffer and window mask.
+            if let Some((pix, pic, _, _)) = self.pix_buf.take() {
+                self.conn.render_free_picture(pic)?.check()?;
+                self.conn.free_pixmap(pix)?.check()?;
+            }
+            if let Some(mask) = self.win_mask_pic.take() {
+                self.conn.render_free_picture(mask)?.check()?;
+            }
+            self.cached_argb_fmt = 0;
+            self.cached_a8_fmt   = 0;
             self.conn.flush()?;
         }
         self.windows.clear();
@@ -856,8 +1015,9 @@ impl<'a> Switcher<'a> {
     pub fn hover_at(&mut self, px: i16, py: i16) -> Result<(), Box<dyn Error>> {
         if let Some(idx) = self.tile_at(px, py) {
             if idx != self.selected {
+                let old = self.selected;
                 self.selected = idx;
-                self.redraw()?;
+                self.border_redraw(old)?;
             }
         }
         Ok(())
@@ -951,6 +1111,20 @@ impl<'a> Switcher<'a> {
 
     pub fn is_visible(&self) -> bool {
         self.popup.is_some()
+    }
+
+    /// Repaint the window in response to an Expose event.
+    /// If the persistent pixmap is already rendered, just blits it (no Xft work).
+    /// Falls back to a full redraw only if the pixmap has been freed (shouldn't
+    /// happen during normal use, but guards against edge cases like window resize).
+    pub fn repaint(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.pix_buf.is_some() && self.cached_argb_fmt != 0 {
+            if self.debug { eprintln!("[hop] repaint() → blit (pix_buf valid)"); }
+            self.blit_to_window()
+        } else {
+            if self.debug { eprintln!("[hop] repaint() → full redraw (pix_buf gone)"); }
+            self.redraw()
+        }
     }
 }
 
