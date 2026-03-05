@@ -107,6 +107,17 @@ pub struct TileConfig {
     /// Corner radius for tile borders (px). 0 = square corners.
     #[serde(default)]
     pub border_radius: u32,
+    /// What to show inside each tile: "icon" (app icon) or "thumbnail" (window screenshot).
+    /// Thumbnails require a compositor (picom) to be running.
+    #[serde(default = "default_tile_content")]
+    pub content: String,
+    /// When content = "thumbnail", also draw a small app icon in the bottom-right
+    /// corner of the thumbnail. Helps identify windows when thumbnails look similar.
+    #[serde(default = "default_icon_overlay")]
+    pub icon_overlay: bool,
+    /// Size of the corner icon overlay in pixels (only used when icon_overlay = true).
+    #[serde(default = "default_icon_overlay_size")]
+    pub icon_overlay_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +176,10 @@ fn default_font_name() -> String { "sans".into() }
 fn default_font_size() -> u32 { 11 }
 fn default_text_shadow_color() -> String { "auto".into() }
 fn default_text_shadow_offset() -> u32 { 1 }
+
+fn default_tile_content() -> String { "icon".into() }
+fn default_icon_overlay() -> bool { true }
+fn default_icon_overlay_size() -> u32 { 32 }
 
 fn default_modifier() -> String { "Alt".into() }
 fn default_next_key() -> String { "Tab".into() }

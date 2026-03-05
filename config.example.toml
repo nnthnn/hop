@@ -48,6 +48,16 @@ background   = "#282a36cc"  # cc ≈ 80% opaque; use "ff" for solid, "00" for tr
 foreground   = "#f8f8f2ff"  # text and icon placeholder color
 frame        = "#bd93f9ff"  # selected tile border
 inactive     = "#44475aff"  # unselected tile border; "00" alpha = invisible border
+# What to show inside each tile.
+# "icon"      — app icon from _NET_WM_ICON or the XDG icon theme (default)
+# "thumbnail" — live screenshot of the window via the compositor's backing pixmap.
+#               Requires picom (or another COMPOSITE-extension compositor) to be running.
+#               Falls back to icon automatically when the compositor is unavailable.
+content      = "icon"
+# When content = "thumbnail", also draw a small app icon in the bottom-right corner
+# of each tile. Useful for identifying windows when thumbnails look similar.
+icon_overlay      = true
+icon_overlay_size = 32   # pixels; the icon is scaled to this size
 # Apply compositor blur only behind each tile region (not the gaps between tiles).
 # Set window.blur = false and tile.blur = true for tile-only blur.
 blur         = false

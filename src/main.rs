@@ -30,6 +30,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         &display.conn, display.root,
         &config.keys.modifier, &config.keys.next, &config.keys.prev,
     )?;
+
+    // Select SubstructureNotify on root so we receive MapNotify and DestroyNotify
+    // events. These are used to keep the thumbnail cache up to date: MapNotify fires
+    // when a window becomes visible (user switches to its desktop), DestroyNotify
+    // fires when a window is closed.
+    display.conn.change_window_attributes(
+        display.root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+    )?.check()?;
+
     display.conn.flush()?;
 
     // Pre-compute binding info so we don't re-parse on every keypress.
@@ -107,6 +117,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                         _ => switcher.click_at(root, ev.event_x, ev.event_y)?,
                     }
                 }
+            }
+
+            // A window was mapped (made visible). This fires when the user switches
+            // to a virtual desktop, causing xfwm4 to re-map the frame windows.
+            // Update the thumbnail cache so off-desktop thumbnails stay fresh.
+            Event::MapNotify(ev) => {
+                switcher.cache_thumb(ev.window);
+            }
+
+            // A window was destroyed. Remove its cache entry to free memory.
+            Event::DestroyNotify(ev) => {
+                switcher.on_window_destroyed(ev.window);
             }
 
             _ => {}

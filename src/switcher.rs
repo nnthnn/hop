@@ -1,5 +1,6 @@
 /// The switcher popup window: layout, rendering, state machine.
 
+use std::collections::HashMap;
 use std::error::Error;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -9,6 +10,7 @@ use x11rb::protocol::render::{
     Color as RenderColor,
     PictOp, PictType, CreatePictureAux, Transform, Pointfix, Repeat,
 };
+use x11rb::protocol::composite::ConnectionExt as CompositeConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 use crate::config::Config;
@@ -24,6 +26,12 @@ pub struct WindowEntry {
     pub name: String,
     /// Raw ARGB pixels (width * height u32 values) from _NET_WM_ICON, if any.
     pub icon: Option<(u32, u32, Vec<u32>)>,
+    /// Visual ID of the window, used to locate the matching XRender format for thumbnails.
+    pub visual: Option<Visualid>,
+    /// The WM frame window: the direct child of root that encloses this client.
+    /// Compositors redirect direct children of root, so NameWindowPixmap must be
+    /// called on this frame rather than on the client window itself.
+    pub frame: Window,
 }
 
 pub struct Switcher<'a> {
@@ -36,6 +44,7 @@ pub struct Switcher<'a> {
     visual_id: Visualid,
     screen_w: u16,
     screen_h: u16,
+    screen_num: usize,
     xft: Option<xh::XftState>,
     /// Persistent off-screen buffer kept alive for the whole popup session.
     /// Reusing the same pixmap avoids allocation overhead and prevents picom
@@ -50,6 +59,11 @@ pub struct Switcher<'a> {
     cached_win_bg: u32,
     /// Verbose event tracing; enabled by HOP_DEBUG env var.
     debug: bool,
+    /// Thumbnail pixel cache keyed by WM frame Window ID.
+    /// Stores ARGB u32 pixels (width × height) captured via NameWindowPixmap + GetImage.
+    /// Used as fallback when a window is on another desktop and its compositor backing
+    /// pixmap is unavailable (NameWindowPixmap returns BadMatch for unmapped windows).
+    thumb_cache: HashMap<Window, (u32, u32, Vec<u32>)>,
 }
 
 impl<'a> Switcher<'a> {
@@ -81,6 +95,7 @@ impl<'a> Switcher<'a> {
             visual_id,
             screen_w: display.screen_width,
             screen_h: display.screen_height,
+            screen_num: display.screen_num,
             xft,
             pix_buf: None,
             win_mask_pic: None,
@@ -88,6 +103,7 @@ impl<'a> Switcher<'a> {
             cached_a8_fmt: 0,
             cached_win_bg: 0,
             debug: std::env::var("HOP_DEBUG").is_ok(),
+            thumb_cache: HashMap::new(),
         })
     }
 
@@ -117,7 +133,12 @@ impl<'a> Switcher<'a> {
             } else {
                 icon
             };
-            self.windows.push(WindowEntry { id, name, icon });
+            let visual = conn.get_window_attributes(id)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|a| a.visual);
+            let frame = find_frame_win(conn, id, root);
+            self.windows.push(WindowEntry { id, name, icon, visual, frame });
         }
         Ok(())
     }
@@ -140,6 +161,25 @@ impl<'a> Switcher<'a> {
             self.selected = self.windows.len() - 1;
         } else {
             self.selected = if self.windows.len() > 1 { 1 } else { 0 };
+        }
+
+        // Register an AUTOMATIC composite redirect so NameWindowPixmap succeeds.
+        // picom uses MANUAL; per the X Composite spec both modes can coexist and
+        // share the same off-screen buffer — this won't disturb picom's rendering.
+        if self.config.tile.content == "thumbnail" {
+            let _ = self.conn.composite_redirect_subwindows(
+                root,
+                x11rb::protocol::composite::Redirect::AUTOMATIC,
+            )?.check();
+            self.conn.flush()?;
+
+            // Pre-populate the cache for all current-desktop windows.
+            // This handles windows on the active desktop even before they generate MapNotify.
+            // Windows on other desktops remain cached from previous MapNotify events.
+            let frames: Vec<Window> = self.windows.iter().map(|e| e.frame).collect();
+            for frame in frames {
+                self.cache_thumb(frame);
+            }
         }
 
         self.create_popup()?;
@@ -463,8 +503,15 @@ impl<'a> Switcher<'a> {
                 )?.check()?;
             }
 
-            // Icon
-            self.draw_icon(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            // Icon or thumbnail
+            if self.config.tile.content == "thumbnail" {
+                self.draw_thumb(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb, &formats)?;
+                if self.config.tile.icon_overlay && a8_fmt != 0 {
+                    self.draw_icon_overlay(pix_pic, fmt, a8_fmt, pixmap, entry, tile_x, tile_y, tw, th)?;
+                }
+            } else {
+                self.draw_icon(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            }
         }
 
         // Redraw the selected tile's frame on top so it's never occluded by an
@@ -740,6 +787,222 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Draw a small app icon in the bottom-right corner of the tile content area,
+    /// semi-transparent, as an overlay on top of a thumbnail. Silently does nothing
+    /// if the entry has no icon data or the overlay is disabled.
+    fn draw_icon_overlay(
+        &self,
+        pix_pic: u32,
+        argb_fmt: u32,
+        a8_fmt: u32,
+        drawable: Window,
+        entry: &WindowEntry,
+        tile_x: i16,
+        tile_y: i16,
+        tile_w: u32,
+        tile_h: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let (src_w, src_h, pixels) = match &entry.icon {
+            Some(icon) => icon,
+            None => return Ok(()),
+        };
+        let (src_w, src_h) = (*src_w, *src_h);
+        if src_w == 0 || src_h == 0 { return Ok(()); }
+
+        let ov_size = self.config.tile.icon_overlay_size.max(8);
+        let pad = self.tile_pad();
+        let avail_w = tile_w.saturating_sub(2 * pad);
+        let avail_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
+        if avail_w < ov_size || avail_h < ov_size { return Ok(()); }
+
+        // Bottom-right corner of the content area, with a small inset margin.
+        let margin = 6i16;
+        let ov_x = tile_x + pad as i16 + avail_w as i16 - ov_size as i16 - margin;
+        let ov_y = tile_y + pad as i16 + avail_h as i16 - ov_size as i16 - margin;
+
+        // Upload icon pixels into a temporary pixmap.
+        let pixmap = self.conn.generate_id()?;
+        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+        let gc = self.conn.generate_id()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+        let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
+        self.conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc,
+            src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes)?.check()?;
+        self.conn.free_gc(gc)?.check()?;
+
+        let icon_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(icon_pic, pixmap, argb_fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.free_pixmap(pixmap)?.check()?;
+
+        // Scale to ov_size if needed.
+        if src_w != ov_size || src_h != ov_size {
+            let sx = (src_w as i64 * 65536 / ov_size as i64) as i32;
+            let sy = (src_h as i64 * 65536 / ov_size as i64) as i32;
+            self.conn.render_set_picture_transform(icon_pic, Transform {
+                matrix11: sx, matrix12: 0, matrix13: 0,
+                matrix21: 0, matrix22: sy, matrix23: 0,
+                matrix31: 0, matrix32: 0, matrix33: 65536,
+            })?.check()?;
+            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?.check()?;
+        }
+
+        // Build a 1×1 A8 alpha-mask picture with repeat, giving 80% opacity.
+        let alpha_pix = self.conn.generate_id()?;
+        self.conn.create_pixmap(8, alpha_pix, drawable, 1, 1)?.check()?;
+        let alpha_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(
+            alpha_pic, alpha_pix, a8_fmt,
+            &CreatePictureAux::new().repeat(Repeat::NORMAL),
+        )?.check()?;
+        self.conn.free_pixmap(alpha_pix)?.check()?;
+        // 80% opacity: 204/255 * 65535 ≈ 52428 in 16-bit XRender alpha space.
+        self.conn.render_fill_rectangles(PictOp::SRC, alpha_pic,
+            RenderColor { red: 0, green: 0, blue: 0, alpha: 52428 },
+            &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
+        )?.check()?;
+
+        // Composite icon over the thumbnail with the alpha mask.
+        self.conn.render_composite(
+            PictOp::OVER,
+            icon_pic, alpha_pic, pix_pic,
+            0, 0, 0, 0,
+            ov_x, ov_y,
+            ov_size as u16, ov_size as u16,
+        )?.check()?;
+
+        self.conn.render_free_picture(alpha_pic)?.check()?;
+        self.conn.render_free_picture(icon_pic)?.check()?;
+        Ok(())
+    }
+
+    /// Render a scaled screenshot of the window (from the compositor's backing pixmap)
+    /// into the tile content area. Falls back to `draw_icon` when the compositor is not
+    /// running, the window is not redirected, or any X11 call fails.
+    fn draw_thumb(
+        &self,
+        pix_pic: u32,
+        argb_fmt: u32,
+        drawable: Window,
+        entry: &WindowEntry,
+        tile_x: i16,
+        tile_y: i16,
+        tile_w: u32,
+        tile_h: u32,
+        fg_argb: u32,
+        formats: &x11rb::protocol::render::QueryPictFormatsReply,
+    ) -> Result<(), Box<dyn Error>> {
+        let pad = self.tile_pad();
+        let avail_w = tile_w.saturating_sub(2 * pad);
+        let avail_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
+
+        if avail_w == 0 || avail_h == 0 {
+            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+        }
+
+        // Use the pre-computed WM frame window (direct child of root).
+        // Compositors redirect only direct children of root, so NameWindowPixmap
+        // must be called on the frame rather than the client window.
+        let frame_win = entry.frame;
+
+        // Get the frame window's visual for XRender format lookup.
+        let visual_id = match self.conn.get_window_attributes(frame_win)
+            .ok().and_then(|c| c.reply().ok()).map(|a| a.visual)
+        {
+            Some(v) => v,
+            None => {
+                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
+                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
+                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                }
+                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            }
+        };
+
+        // Grab the compositor's off-screen backing pixmap for the frame window.
+        let thumb_pix = self.conn.generate_id()?;
+        let name_ok = self.conn
+            .composite_name_window_pixmap(frame_win, thumb_pix)
+            .ok().and_then(|c| c.check().ok()).is_some();
+        if !name_ok {
+            // Window is likely on another desktop (unmapped). Try the pixel cache.
+            if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
+                return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
+                    cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+            }
+            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+        }
+
+        // Query actual window dimensions via the pixmap geometry.
+        let geom = match self.conn.get_geometry(thumb_pix).ok().and_then(|c| c.reply().ok()) {
+            Some(g) => g,
+            None => {
+                let _ = self.conn.free_pixmap(thumb_pix).ok();
+                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
+                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
+                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                }
+                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            }
+        };
+        let src_w = geom.width as u32;
+        let src_h = geom.height as u32;
+        if src_w == 0 || src_h == 0 {
+            let _ = self.conn.free_pixmap(thumb_pix).ok();
+            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+        }
+
+        // Find the XRender PictFormat that matches this window's visual.
+        let win_fmt_id = match find_format_for_visual(formats, visual_id, self.screen_num) {
+            Some(id) => id,
+            None => {
+                let _ = self.conn.free_pixmap(thumb_pix).ok();
+                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
+                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
+                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                }
+                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            }
+        };
+
+        // Create an XRender Picture for the pixmap; the picture holds a server-side
+        // reference so we can free the pixmap name immediately.
+        let thumb_pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(thumb_pic, thumb_pix, win_fmt_id, &CreatePictureAux::new())?.check()?;
+        self.conn.free_pixmap(thumb_pix)?.check()?;
+
+        // Scale the window to fit inside (avail_w × avail_h), preserving aspect ratio.
+        let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
+        let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
+        let dst_h = ((src_h as f64 / scale).round() as u32).max(1).min(avail_h);
+
+        // Center the thumbnail within the available content area.
+        let dst_x = tile_x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
+        let dst_y = tile_y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
+
+        // Set a bilinear scaling transform (16.16 fixed-point).
+        let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
+        let sy = ((src_h as f64 / dst_h as f64) * 65536.0).round() as i32;
+        self.conn.render_set_picture_transform(thumb_pic, Transform {
+            matrix11: sx, matrix12: 0, matrix13: 0,
+            matrix21: 0, matrix22: sy, matrix23: 0,
+            matrix31: 0, matrix32: 0, matrix33: 65536,
+        })?.check()?;
+        self.conn.render_set_picture_filter(thumb_pic, b"bilinear", &[])?.check()?;
+
+        // Composite the thumbnail onto the off-screen buffer.
+        self.conn.render_composite(
+            PictOp::OVER,
+            thumb_pic, 0u32, pix_pic,
+            0, 0,   // src_x, src_y
+            0, 0,   // mask_x, mask_y
+            dst_x, dst_y,
+            dst_w as u16, dst_h as u16,
+        )?.check()?;
+
+        self.conn.render_free_picture(thumb_pic)?.check()?;
+        Ok(())
+    }
+
     /// Render the window title at the bottom of a tile.
     /// Uses Xft (antialiased, Fontconfig names) when available, bitmap fonts as fallback.
     fn draw_label(
@@ -978,6 +1241,14 @@ impl<'a> Switcher<'a> {
     fn hide(&mut self) -> Result<(), Box<dyn Error>> {
         if self.debug { eprintln!("[hop] hide()"); }
         if let Some(win) = self.popup.take() {
+            // Release the AUTOMATIC composite redirect we registered in show().
+            if self.config.tile.content == "thumbnail" {
+                let root = self.conn.setup().roots[self.screen_num].root;
+                let _ = self.conn.composite_unredirect_subwindows(
+                    root,
+                    x11rb::protocol::composite::Redirect::AUTOMATIC,
+                )?.check();
+            }
             self.conn.ungrab_keyboard(0u32)?.check()?;
             self.conn.destroy_window(win)?.check()?;
             // Free the persistent off-screen buffer and window mask.
@@ -1105,6 +1376,131 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Capture and cache a thumbnail for `frame_win` (a direct child of root).
+    /// Downloads the compositor's backing pixmap pixels via GetImage and stores them
+    /// as ARGB u32 values. Called on MapNotify and at popup-open time so thumbnails
+    /// remain available after windows move to other desktops and become unmapped.
+    /// Silently does nothing if the window is not redirected or any call fails.
+    pub fn cache_thumb(&mut self, frame_win: Window) {
+        if self.config.tile.content != "thumbnail" {
+            return;
+        }
+        let pix_id = match self.conn.generate_id() {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        let ok = self.conn
+            .composite_name_window_pixmap(frame_win, pix_id)
+            .ok()
+            .and_then(|c| c.check().ok())
+            .is_some();
+        if !ok {
+            return;
+        }
+        let geom = match self.conn.get_geometry(pix_id).ok().and_then(|c| c.reply().ok()) {
+            Some(g) => g,
+            None => { let _ = self.conn.free_pixmap(pix_id).ok(); return; }
+        };
+        let w = geom.width as u32;
+        let h = geom.height as u32;
+        // Skip unreasonably large or empty pixmaps.
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            let _ = self.conn.free_pixmap(pix_id).ok();
+            return;
+        }
+        // Download all pixels as Z_PIXMAP (native-endian 32-bit values).
+        let image = match self.conn.get_image(
+            ImageFormat::Z_PIXMAP,
+            pix_id, 0, 0, geom.width, geom.height, !0u32,
+        ).ok().and_then(|c| c.reply().ok()) {
+            Some(img) => img,
+            None => { let _ = self.conn.free_pixmap(pix_id).ok(); return; }
+        };
+        let _ = self.conn.free_pixmap(pix_id).ok();
+
+        let depth = image.depth;
+        let data = &image.data;
+        let n = (w * h) as usize;
+        if data.len() < n * 4 { return; }
+
+        // Convert from server native-endian BGR(A) to ARGB u32.
+        // On little-endian x86: bytes are [B, G, R, A/pad] per pixel.
+        let pixels: Vec<u32> = data[..n * 4]
+            .chunks_exact(4)
+            .map(|c| {
+                let a = if depth == 32 { c[3] as u32 } else { 0xFF };
+                (a << 24) | ((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32
+            })
+            .collect();
+
+        if self.debug {
+            eprintln!("[hop] cache_thumb({frame_win:#x}): {w}x{h} depth={depth}");
+        }
+        self.thumb_cache.insert(frame_win, (w, h, pixels));
+    }
+
+    /// Remove stale cache entries when a window is destroyed.
+    pub fn on_window_destroyed(&mut self, win: Window) {
+        self.thumb_cache.remove(&win);
+    }
+
+    /// Upload ARGB pixel data into a temporary pixmap, scale it to fit within
+    /// `(avail_w × avail_h)` preserving aspect ratio, and composite OVER `pix_pic`.
+    /// Used to render cached thumbnails for off-desktop windows.
+    fn draw_pixels_scaled(
+        &self,
+        pix_pic: u32,
+        argb_fmt: u32,
+        drawable: Window,
+        pixels: &[u32],
+        src_w: u32,
+        src_h: u32,
+        tile_x: i16,
+        tile_y: i16,
+        avail_w: u32,
+        avail_h: u32,
+        pad: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        if src_w == 0 || src_h == 0 { return Ok(()); }
+
+        let pixmap = self.conn.generate_id()?;
+        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+        let gc = self.conn.generate_id()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+        let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
+        self.conn.put_image(
+            ImageFormat::Z_PIXMAP, pixmap, gc,
+            src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes,
+        )?.check()?;
+        self.conn.free_gc(gc)?.check()?;
+
+        let pic = self.conn.generate_id()?;
+        self.conn.render_create_picture(pic, pixmap, argb_fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.free_pixmap(pixmap)?.check()?;
+
+        let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
+        let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
+        let dst_h = ((src_h as f64 / scale).round() as u32).max(1).min(avail_h);
+        let dst_x = tile_x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
+        let dst_y = tile_y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
+
+        let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
+        let sy = ((src_h as f64 / dst_h as f64) * 65536.0).round() as i32;
+        self.conn.render_set_picture_transform(pic, Transform {
+            matrix11: sx, matrix12: 0, matrix13: 0,
+            matrix21: 0, matrix22: sy, matrix23: 0,
+            matrix31: 0, matrix32: 0, matrix33: 65536,
+        })?.check()?;
+        self.conn.render_set_picture_filter(pic, b"bilinear", &[])?.check()?;
+
+        self.conn.render_composite(
+            PictOp::OVER, pic, 0u32, pix_pic,
+            0, 0, 0, 0, dst_x, dst_y, dst_w as u16, dst_h as u16,
+        )?.check()?;
+        self.conn.render_free_picture(pic)?.check()?;
+        Ok(())
+    }
+
     pub fn popup_window(&self) -> Option<Window> {
         self.popup
     }
@@ -1124,6 +1520,20 @@ impl<'a> Switcher<'a> {
         } else {
             if self.debug { eprintln!("[hop] repaint() → full redraw (pix_buf gone)"); }
             self.redraw()
+        }
+    }
+}
+
+/// Walk up the window hierarchy to find the WM frame: the direct child of root
+/// that contains `client`. Compositors redirect only direct children of root,
+/// so NameWindowPixmap must be called on the frame, not the client window.
+fn find_frame_win(conn: &RustConnection, client: Window, root: Window) -> Window {
+    let mut w = client;
+    loop {
+        match conn.query_tree(w).ok().and_then(|c| c.reply().ok()) {
+            Some(t) if t.parent == root || t.parent == 0 => return w,
+            Some(t) if t.parent != w => w = t.parent,
+            _ => return client,
         }
     }
 }
@@ -1374,6 +1784,25 @@ fn resolve_shadow_color(shadow_color_str: &str, fg_argb: u32) -> u32 {
     } else {
         Config::color_argb(shadow_color_str)
     }
+}
+
+/// Find the XRender PictFormat ID for the given visual on the given screen.
+/// Used to create a Picture from a composite backing pixmap whose depth may differ
+/// from our ARGB32 popup (e.g., a 24-bit window has a 24-bit format).
+fn find_format_for_visual(
+    formats: &x11rb::protocol::render::QueryPictFormatsReply,
+    visual_id: Visualid,
+    screen_num: usize,
+) -> Option<u32> {
+    let screen = formats.screens.get(screen_num)?;
+    for depth in &screen.depths {
+        for visual in &depth.visuals {
+            if visual.visual == visual_id {
+                return Some(visual.format);
+            }
+        }
+    }
+    None
 }
 
 /// Find the XRender A8 (8-bit alpha-only) picture format.
