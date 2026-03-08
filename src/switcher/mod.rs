@@ -74,6 +74,7 @@ pub struct Switcher<'a> {
     popup: Option<Window>,
     colormap: Colormap,
     visual_id: Visualid,
+    root: Window,
     screen_w: u16,
     screen_h: u16,
     screen_num: usize,
@@ -128,6 +129,7 @@ impl<'a> Switcher<'a> {
             popup: None,
             colormap,
             visual_id,
+            root: display.root,
             screen_w: display.screen_width,
             screen_h: display.screen_height,
             screen_num: display.screen_num,
@@ -221,6 +223,13 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Get the monitor that currently contains the mouse pointer.
+    fn current_monitor(&self) -> xh::MonitorGeom {
+        let monitors = xh::query_monitors(self.conn, self.screen_w, self.screen_h);
+        let (px, py) = xh::pointer_position(self.conn, self.root);
+        xh::monitor_at(&monitors, px, py)
+    }
+
     fn tile_w(&self) -> u32 { self.config.tile.width }
     fn tile_h(&self) -> u32 { self.config.tile.height }
     fn frame_w(&self) -> u32 { self.config.tile.border_width.max(1) }
@@ -230,7 +239,7 @@ impl<'a> Switcher<'a> {
     fn border_radius(&self) -> u32 { self.config.tile.border_radius }
 
     /// Compute how many columns (and resulting rows) fit without the popup
-    /// getting within SCREEN_MARGIN pixels of the screen edges.
+    /// getting within SCREEN_MARGIN pixels of the monitor edges.
     fn grid_layout(&self) -> (usize, usize) {
         let n = self.windows.len();
         if n == 0 { return (1, 0); }
@@ -238,9 +247,10 @@ impl<'a> Switcher<'a> {
         let fw  = self.frame_w();
         let gap = self.gap_w();
         let wp  = self.win_pad();
+        let mon = self.current_monitor();
         // Each tile slot is (tw + fw + gap) wide; the window also needs fw + 2*wp overhead.
         // Solving: n_cols*(tw+fw+gap) ≤ available - fw - 2*wp + gap
-        let available = (self.screen_w as u32).saturating_sub(2 * SCREEN_MARGIN);
+        let available = (mon.w as u32).saturating_sub(2 * SCREEN_MARGIN);
         let slot   = (tw + fw + gap).max(1);
         let budget = available.saturating_sub(fw + 2 * wp).saturating_add(gap);
         let n_cols = ((budget / slot) as usize).max(1).min(n);
@@ -293,8 +303,19 @@ impl<'a> Switcher<'a> {
         // Layout per axis: [wp][fw][tile][fw][gap]...[fw][tile][fw][wp]
         let w = (self.tile_w() + fw) * nc + fw + nc.saturating_sub(1) * gap + 2 * wp;
         let h = (self.tile_h() + fw) * nr + fw + nr.saturating_sub(1) * gap + 2 * wp;
-        let x = ((self.screen_w as u32).saturating_sub(w) / 2) as i16;
-        let y = ((self.screen_h as u32).saturating_sub(h) / 2) as i16;
+        let (x, y) = match self.config.window.position.split_once(',') {
+            Some((xs, ys)) => (
+                xs.trim().parse::<i16>().unwrap_or(0),
+                ys.trim().parse::<i16>().unwrap_or(0),
+            ),
+            None => {
+                let mon = self.current_monitor();
+                (
+                    (mon.x as u32 + (mon.w as u32).saturating_sub(w) / 2) as i16,
+                    (mon.y as u32 + (mon.h as u32).saturating_sub(h) / 2) as i16,
+                )
+            },
+        };
         (x, y, w as u16, h as u16)
     }
 

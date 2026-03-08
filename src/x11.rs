@@ -4,6 +4,7 @@ use std::error::Error;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
+use x11rb::protocol::xinerama::ConnectionExt as XineramaConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 use x11::xlib;
@@ -539,4 +540,63 @@ fn switch_to_desktop(conn: &RustConnection, root: Window, desktop: u32) -> Resul
     )?.check()?;
     conn.flush()?;
     Ok(())
+}
+
+/// Monitor geometry rectangle.
+#[derive(Debug, Clone, Copy)]
+pub struct MonitorGeom {
+    pub x: i16,
+    pub y: i16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Query per-monitor geometry via Xinerama.
+/// Falls back to the root screen dimensions if Xinerama is unavailable.
+pub fn query_monitors(conn: &RustConnection, screen_w: u16, screen_h: u16) -> Vec<MonitorGeom> {
+    let active = conn.xinerama_is_active()
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.state != 0)
+        .unwrap_or(false);
+
+    if active {
+        let Ok(cookie) = conn.xinerama_query_screens() else {
+            return vec![MonitorGeom { x: 0, y: 0, w: screen_w, h: screen_h }];
+        };
+        let Ok(reply) = cookie.reply() else {
+            return vec![MonitorGeom { x: 0, y: 0, w: screen_w, h: screen_h }];
+        };
+        let monitors: Vec<MonitorGeom> = reply.screen_info.iter().map(|s| MonitorGeom {
+            x: s.x_org,
+            y: s.y_org,
+            w: s.width,
+            h: s.height,
+        }).collect();
+        if !monitors.is_empty() {
+            return monitors;
+        }
+    }
+
+    vec![MonitorGeom { x: 0, y: 0, w: screen_w, h: screen_h }]
+}
+
+/// Get the current pointer position relative to the root window.
+pub fn pointer_position(conn: &RustConnection, root: Window) -> (i16, i16) {
+    conn.query_pointer(root)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| (r.root_x, r.root_y))
+        .unwrap_or((0, 0))
+}
+
+/// Find which monitor contains the given point.
+pub fn monitor_at(monitors: &[MonitorGeom], x: i16, y: i16) -> MonitorGeom {
+    monitors.iter()
+        .find(|m| {
+            x >= m.x && x < m.x + m.w as i16
+                && y >= m.y && y < m.y + m.h as i16
+        })
+        .copied()
+        .unwrap_or(monitors[0])
 }
