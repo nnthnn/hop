@@ -172,7 +172,7 @@ pub fn grab_keys(
     let prev_extra  = ModMask::from(prev_extra_u32 as u16);
 
     if let Some(next_code) = keysym_to_keycode(conn, next_sym)? {
-        for lock in offending_modifiers(conn)? {
+        for lock in offending_modifiers() {
             conn.grab_key(true, root, primary | next_extra | lock,
                 next_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
         }
@@ -181,7 +181,7 @@ pub fn grab_keys(
     // Grab prev separately only when it differs from next in keycode or modifiers.
     if prev_sym != next_sym || prev_extra_u32 != next_extra_u32 {
         if let Some(prev_code) = keysym_to_keycode(conn, prev_sym)? {
-            for lock in offending_modifiers(conn)? {
+            for lock in offending_modifiers() {
                 conn.grab_key(true, root, primary | prev_extra | lock,
                     prev_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
             }
@@ -192,10 +192,9 @@ pub fn grab_keys(
 }
 
 /// Return all modifier combinations to grab (handles NumLock, CapsLock, ScrollLock).
-fn offending_modifiers(conn: &RustConnection) -> Result<Vec<ModMask>, Box<dyn Error>> {
+fn offending_modifiers() -> Vec<ModMask> {
     // For simplicity, grab with and without common lock modifiers
-    let locks = [ModMask::from(0u16), ModMask::LOCK, ModMask::M2, ModMask::LOCK | ModMask::M2];
-    Ok(locks.to_vec())
+    [ModMask::from(0u16), ModMask::LOCK, ModMask::M2, ModMask::LOCK | ModMask::M2].to_vec()
 }
 
 /// Map a key name to its X11 keysym. Returns 0 for unrecognised names.
@@ -236,8 +235,6 @@ pub fn get_window_list(
     conn: &RustConnection,
     root: Window,
 ) -> Result<Vec<Window>, Box<dyn Error>> {
-    use x11rb::protocol::xproto::AtomEnum;
-
     let atom = intern_atom(conn, "_NET_CLIENT_LIST_STACKING")?;
     if atom == 0 {
         // Fall back to _NET_CLIENT_LIST
@@ -320,7 +317,7 @@ pub fn get_window_icon(
         if i + (w * h) as usize > data.len() {
             break;
         }
-        let is_better = best.map_or(true, |(bw, bh, _)| {
+        let is_better = best.map_or(true, |(bw, _, _)| {
             let cur_diff = (w as i64 - target_size as i64).unsigned_abs();
             let best_diff = (bw as i64 - target_size as i64).unsigned_abs();
             cur_diff < best_diff || (cur_diff == best_diff && w > bw)

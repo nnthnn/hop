@@ -1,6 +1,6 @@
 /// The switcher popup window: layout, rendering, state machine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -26,8 +26,6 @@ pub struct WindowEntry {
     pub name: String,
     /// Raw ARGB pixels (width * height u32 values) from _NET_WM_ICON, if any.
     pub icon: Option<(u32, u32, Vec<u32>)>,
-    /// Visual ID of the window, used to locate the matching XRender format for thumbnails.
-    pub visual: Option<Visualid>,
     /// The WM frame window: the direct child of root that encloses this client.
     /// Compositors redirect direct children of root, so NameWindowPixmap must be
     /// called on this frame rather than on the client window itself.
@@ -64,6 +62,9 @@ pub struct Switcher<'a> {
     /// Used as fallback when a window is on another desktop and its compositor backing
     /// pixmap is unavailable (NameWindowPixmap returns BadMatch for unmapped windows).
     thumb_cache: HashMap<Window, (u32, u32, Vec<u32>)>,
+    /// Frames still waiting for a thumbnail to be fetched (progressive loading).
+    /// Populated by show(); drained one entry per event-loop iteration by pump_one_thumb().
+    thumb_queue: VecDeque<Window>,
 }
 
 impl<'a> Switcher<'a> {
@@ -104,6 +105,7 @@ impl<'a> Switcher<'a> {
             cached_win_bg: 0,
             debug: std::env::var("HOP_DEBUG").is_ok(),
             thumb_cache: HashMap::new(),
+            thumb_queue: VecDeque::new(),
         })
     }
 
@@ -133,12 +135,8 @@ impl<'a> Switcher<'a> {
             } else {
                 icon
             };
-            let visual = conn.get_window_attributes(id)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|a| a.visual);
             let frame = find_frame_win(conn, id, root);
-            self.windows.push(WindowEntry { id, name, icon, visual, frame });
+            self.windows.push(WindowEntry { id, name, icon, frame });
         }
         Ok(())
     }
@@ -172,19 +170,20 @@ impl<'a> Switcher<'a> {
                 x11rb::protocol::composite::Redirect::AUTOMATIC,
             )?.check();
             self.conn.flush()?;
-
-            // Pre-populate the cache for all current-desktop windows.
-            // This handles windows on the active desktop even before they generate MapNotify.
-            // Windows on other desktops remain cached from previous MapNotify events.
-            let frames: Vec<Window> = self.windows.iter().map(|e| e.frame).collect();
-            for frame in frames {
-                self.cache_thumb(frame);
-            }
         }
 
         self.create_popup()?;
         if self.debug { eprintln!("[hop] show(): {} windows, selected={}", self.windows.len(), self.selected); }
+        // Draw immediately with whatever is already cached (icons for uncached windows).
+        // Thumbnails are loaded progressively by pump_one_thumb() in the event loop.
         self.redraw()?;
+
+        if self.config.tile.content == "thumbnail" {
+            // Queue frames for progressive thumbnail loading. Already-cached entries
+            // (from MapNotify) will be refreshed; uncached ones loaded for the first time.
+            self.thumb_queue = self.windows.iter().map(|e| e.frame).collect();
+        }
+
         Ok(())
     }
 
@@ -211,7 +210,7 @@ impl<'a> Switcher<'a> {
         let slot   = (tw + fw + gap).max(1);
         let budget = available.saturating_sub(fw + 2 * wp).saturating_add(gap);
         let n_cols = ((budget / slot) as usize).max(1).min(n);
-        let n_rows = (n + n_cols - 1) / n_cols;
+        let n_rows = n.div_ceil(n_cols);
         (n_cols, n_rows)
     }
 
@@ -230,7 +229,7 @@ impl<'a> Switcher<'a> {
         // If the last row is not full, offset tiles according to last_row_position.
         let x_extra: u32 = {
             let n = self.windows.len();
-            let n_rows = (n + nc - 1) / nc;
+            let n_rows = n.div_ceil(nc);
             let last_row = n_rows.saturating_sub(1);
             if row as usize == last_row {
                 let last_count = n - last_row * nc;
@@ -1178,7 +1177,7 @@ impl<'a> Switcher<'a> {
         let h_pad = 10u32.saturating_add(self.tile_pad());
         let v_pad = self.tile_pad();
         let inner_w = tile_w.saturating_sub(2 * h_pad);
-        let label_x = tile_x + (h_pad as i16) + inner_w.saturating_sub(text_w).wrapping_div(2) as i16;
+        let label_x = tile_x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
         let label_y = tile_y + tile_h as i16 - 4 - v_pad as i16;
 
         let gc = self.conn.generate_id()?;
@@ -1264,6 +1263,7 @@ impl<'a> Switcher<'a> {
             self.conn.flush()?;
         }
         self.windows.clear();
+        self.thumb_queue.clear();
         Ok(())
     }
 
@@ -1379,6 +1379,25 @@ impl<'a> Switcher<'a> {
     /// Capture and cache a thumbnail for `frame_win` (a direct child of root).
     /// Downloads the compositor's backing pixmap pixels via GetImage and stores them
     /// as ARGB u32 values. Called on MapNotify and at popup-open time so thumbnails
+    /// True while there are frames still waiting for their thumbnail to be fetched.
+    /// Used by the event loop to decide between blocking and non-blocking event polling.
+    pub fn has_pending_thumbs(&self) -> bool {
+        !self.thumb_queue.is_empty()
+    }
+
+    /// Fetch one thumbnail from the front of the queue and update the display.
+    /// Called from the event loop (after polling for events) so that the popup
+    /// appears immediately and thumbnails fill in one per iteration.
+    pub fn pump_one_thumb(&mut self) -> Result<(), Box<dyn Error>> {
+        let frame = match self.thumb_queue.pop_front() {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        self.cache_thumb(frame);
+        // Redraw now so each thumbnail appears as soon as it's ready.
+        self.redraw()
+    }
+
     /// remain available after windows move to other desktops and become unmapped.
     /// Silently does nothing if the window is not redirected or any call fails.
     pub fn cache_thumb(&mut self, frame_win: Window) {
@@ -1433,10 +1452,26 @@ impl<'a> Switcher<'a> {
             })
             .collect();
 
+        // Downscale to tile content size before storing so that draw_pixels_scaled
+        // uploads only ~tile-sized pixel data (~170KB) instead of full-resolution
+        // window pixels (~8MB). This makes each redraw 40-50× cheaper.
+        let pad = self.config.tile.padding;
+        let avail_w = self.config.tile.width.saturating_sub(2 * pad).max(1);
+        let avail_h = self.config.tile.height.saturating_sub(LABEL_H + 2 * pad).max(1);
+        let scale = (w as f64 / avail_w as f64).max(h as f64 / avail_h as f64);
+        let (store_w, store_h, pixels) = if scale > 1.0 {
+            let dst_w = ((w as f64 / scale).round() as u32).max(1);
+            let dst_h = ((h as f64 / scale).round() as u32).max(1);
+            let scaled = downscale_argb(&pixels, w, h, dst_w, dst_h);
+            (dst_w, dst_h, scaled)
+        } else {
+            (w, h, pixels)
+        };
+
         if self.debug {
-            eprintln!("[hop] cache_thumb({frame_win:#x}): {w}x{h} depth={depth}");
+            eprintln!("[hop] cache_thumb({frame_win:#x}): {w}x{h} depth={depth} → stored {store_w}x{store_h}");
         }
-        self.thumb_cache.insert(frame_win, (w, h, pixels));
+        self.thumb_cache.insert(frame_win, (store_w, store_h, pixels));
     }
 
     /// Remove stale cache entries when a window is destroyed.
@@ -1524,6 +1559,41 @@ impl<'a> Switcher<'a> {
     }
 }
 
+/// Box-filter downscale of ARGB u32 pixels from (src_w×src_h) to (dst_w×dst_h).
+/// Each destination pixel is the average of the corresponding source block.
+/// Only called when dst is smaller than src; caller must ensure dst > 0.
+fn downscale_argb(pixels: &[u32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u32> {
+    let mut out = vec![0u32; (dst_w * dst_h) as usize];
+    let x_ratio = src_w as f64 / dst_w as f64;
+    let y_ratio = src_h as f64 / dst_h as f64;
+    for dy in 0..dst_h {
+        let y0 = (dy as f64 * y_ratio) as u32;
+        let y1 = ((dy + 1) as f64 * y_ratio) as u32;
+        let y1 = y1.min(src_h);
+        for dx in 0..dst_w {
+            let x0 = (dx as f64 * x_ratio) as u32;
+            let x1 = ((dx + 1) as f64 * x_ratio) as u32;
+            let x1 = x1.min(src_w);
+            let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let p = pixels[(sy * src_w + sx) as usize];
+                    a += ((p >> 24) & 0xFF) as u64;
+                    r += ((p >> 16) & 0xFF) as u64;
+                    g += ((p >>  8) & 0xFF) as u64;
+                    b += ( p        & 0xFF) as u64;
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                out[(dy * dst_w + dx) as usize] =
+                    (((a/n) as u32) << 24) | (((r/n) as u32) << 16) | (((g/n) as u32) << 8) | (b/n) as u32;
+            }
+        }
+    }
+    out
+}
+
 /// Walk up the window hierarchy to find the WM frame: the direct child of root
 /// that contains `client`. Compositors redirect only direct children of root,
 /// so NameWindowPixmap must be called on the frame, not the client window.
@@ -1570,12 +1640,16 @@ fn open_core_font(
 /// Truncate a window title to at most `max_chars` characters, appending "..." if needed.
 fn truncate_title(s: &str, max_chars: usize) -> String {
     let s = s.trim();
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        format!("{}...", truncated)
+    // Use char_indices to count without iterating the whole string when within limit.
+    let mut char_count = 0;
+    for (_, _) in s.char_indices() {
+        char_count += 1;
+        if char_count > max_chars {
+            let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+            return format!("{}...", truncated);
+        }
     }
+    s.to_string()
 }
 
 /// Search standard XDG icon theme paths for a PNG icon matching `class`.

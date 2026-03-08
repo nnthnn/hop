@@ -187,19 +187,75 @@ fn default_prev_key() -> String { "Shift+Tab".into() }
 fn default_cancel_key() -> String { "Escape".into() }
 
 impl Default for Config {
-    fn default() -> Self { toml::from_str("").unwrap() }
+    fn default() -> Self {
+        Config {
+            window: WindowConfig::default(),
+            tile:   TileConfig::default(),
+            font:   FontConfig::default(),
+            keys:   KeysConfig::default(),
+        }
+    }
 }
 impl Default for WindowConfig {
-    fn default() -> Self { toml::from_str("").unwrap() }
+    fn default() -> Self {
+        WindowConfig {
+            position:            default_position(),
+            outer_border_width:  0,
+            border:              default_border(),
+            background:          default_window_bg(),
+            background_gradient: default_background_gradient(),
+            blur:                true,
+            blur_method:         default_blur_method(),
+            blur_strength:       default_blur_strength(),
+            gap:                 0,
+            padding:             0,
+            last_row_position:   default_last_row_position(),
+            shadow:              false,
+            corners:             false,
+            border_radius:       0,
+        }
+    }
 }
 impl Default for TileConfig {
-    fn default() -> Self { toml::from_str("").unwrap() }
+    fn default() -> Self {
+        TileConfig {
+            width:             default_tile_width(),
+            height:            default_tile_height(),
+            icon_size:         default_icon_size(),
+            border_width:      default_border_width(),
+            padding:           0,
+            background:        default_bg(),
+            foreground:        default_fg(),
+            frame:             default_frame(),
+            inactive:          default_inactive(),
+            blur:              false,
+            border_radius:     0,
+            content:           default_tile_content(),
+            icon_overlay:      default_icon_overlay(),
+            icon_overlay_size: default_icon_overlay_size(),
+        }
+    }
 }
 impl Default for FontConfig {
-    fn default() -> Self { toml::from_str("").unwrap() }
+    fn default() -> Self {
+        FontConfig {
+            name:          default_font_name(),
+            size:          default_font_size(),
+            shadow:        false,
+            shadow_color:  default_text_shadow_color(),
+            shadow_offset: default_text_shadow_offset(),
+        }
+    }
 }
 impl Default for KeysConfig {
-    fn default() -> Self { toml::from_str("").unwrap() }
+    fn default() -> Self {
+        KeysConfig {
+            modifier: default_modifier(),
+            next:     default_next_key(),
+            prev:     default_prev_key(),
+            cancel:   default_cancel_key(),
+        }
+    }
 }
 
 impl Config {
