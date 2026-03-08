@@ -55,9 +55,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = display.root;
 
     loop {
-        let event = display.conn.wait_for_event()?;
+        // While thumbnails are loading, poll non-blocking so we can interleave
+        // input handling with one GetImage download per iteration. When idle,
+        // block until the next event to avoid busy-waiting.
+        let maybe_event = if switcher.has_pending_thumbs() {
+            display.conn.poll_for_event()?
+        } else {
+            Some(display.conn.wait_for_event()?)
+        };
 
-        match event {
+        if let Some(event) = maybe_event { match event {
             Event::KeyPress(ev) => {
                 let sym  = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
                 let mods = u32::from(ev.state);
@@ -132,6 +139,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             _ => {}
+        } } // end match event / if let Some(event)
+
+        // Progressive thumbnail loading: fetch one frame per loop iteration.
+        // Runs only while the popup is visible and the queue is non-empty.
+        if switcher.has_pending_thumbs() {
+            switcher.pump_one_thumb()?;
         }
     }
 }
