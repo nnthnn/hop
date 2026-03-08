@@ -20,6 +20,28 @@ use crate::x11 as xh;
 const LABEL_H: u32 = 48;    // pixels reserved at the bottom of each tile for the title label
 const TITLE_MAX_CHARS: usize = 100; // hard cap so absurdly long titles don't bust layout
 const SCREEN_MARGIN: u32 = 40;     // minimum gap (px) between popup edge and screen edge
+/// Maximum number of entries kept in the thumbnail pixel cache.
+/// Entries for windows not in the current list are evicted first; after that
+/// an arbitrary entry is dropped so the cap is always respected.
+const MAX_THUMB_CACHE: usize = 64;
+
+/// Tile position and size in popup-relative coordinates.
+#[derive(Clone, Copy)]
+struct TileGeom { x: i16, y: i16, w: u32, h: u32 }
+
+/// XRender destination picture, format IDs, and backing drawable.
+/// Bundled to avoid threading 4 related values through every draw function.
+#[derive(Clone, Copy)]
+struct PictCtx {
+    /// The XRender picture to composite into.
+    pic: u32,
+    /// ARGB32 picture format ID.
+    argb_fmt: u32,
+    /// A8 (alpha-only) picture format ID. May be 0 if rounded corners are disabled.
+    a8_fmt: u32,
+    /// X11 drawable backing `pic`. Used when creating temporary pixmaps.
+    drawable: Window,
+}
 
 pub struct WindowEntry {
     pub id: Window,
@@ -456,9 +478,11 @@ impl<'a> Switcher<'a> {
         let fw32 = self.frame_w();
         let (n_cols, _) = self.grid_layout();
         let use_rounded = br > 0 && a8_fmt != 0;
+        let ctx = PictCtx { pic: pix_pic, argb_fmt: fmt, a8_fmt, drawable: pixmap };
 
         for (i, entry) in self.windows.iter().enumerate() {
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
+            let tile = TileGeom { x: tile_x, y: tile_y, w: tw, h: th };
             let border_argb = if i == self.selected { frame_argb } else { inact_argb };
 
             if use_rounded {
@@ -469,13 +493,13 @@ impl<'a> Switcher<'a> {
                 let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
                 // Tile background: inner rounded rect, composited OVER window bg.
                 draw_filled_rounded_rect(
-                    self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                    self.conn, ctx,
                     tile_x, tile_y, tw, th, inner_r, bg_argb,
                 )?;
                 // Border ring: outer shape minus inner shape, so it only covers
                 // the fw-wide ring and never overwrites the bg or icon area.
                 draw_border_ring(
-                    self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                    self.conn, ctx,
                     tile_x - fw as i16, tile_y - fw as i16,
                     tw + 2*fw32, th + 2*fw32,
                     outer_r, fw32, inner_r, border_argb,
@@ -504,12 +528,12 @@ impl<'a> Switcher<'a> {
 
             // Icon or thumbnail
             if self.config.tile.content == "thumbnail" {
-                self.draw_thumb(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb, &formats)?;
+                self.draw_thumb(ctx, tile, entry, fg_argb, &formats)?;
                 if self.config.tile.icon_overlay && a8_fmt != 0 {
-                    self.draw_icon_overlay(pix_pic, fmt, a8_fmt, pixmap, entry, tile_x, tile_y, tw, th)?;
+                    self.draw_icon_overlay(ctx, tile, entry)?;
                 }
             } else {
-                self.draw_icon(pix_pic, fmt, pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
+                self.draw_icon(ctx, tile, entry, fg_argb)?;
             }
         }
 
@@ -522,7 +546,7 @@ impl<'a> Switcher<'a> {
             let outer_r = br.min((tw + 2*fw32) / 2).min((th + 2*fw32) / 2);
             let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
             draw_border_ring(
-                self.conn, pix_pic, fmt, a8_fmt, pixmap,
+                self.conn, ctx,
                 sel_x - fw as i16, sel_y - fw as i16,
                 tw + 2*fw32, th + 2*fw32,
                 outer_r, fw32, inner_r, frame_argb,
@@ -547,7 +571,8 @@ impl<'a> Switcher<'a> {
         // Draw Xft text labels onto the off-screen pixmap.
         for (i, entry) in self.windows.iter().enumerate() {
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
-            self.draw_label(pixmap, entry, tile_x, tile_y, tw, th, fg_argb)?;
+            let tile = TileGeom { x: tile_x, y: tile_y, w: tw, h: th };
+            self.draw_label(pixmap, entry, tile, fg_argb)?;
         }
 
         // XSync the Xlib connection: wait for the server to finish all Xft draws
@@ -676,7 +701,8 @@ impl<'a> Switcher<'a> {
                 }
 
                 draw_border_ring(
-                    self.conn, pix_pic, argb_fmt, a8_fmt, pixmap,
+                    self.conn,
+                    PictCtx { pic: pix_pic, argb_fmt, a8_fmt, drawable: pixmap },
                     tile_x - fw as i16, tile_y - fw as i16,
                     tw + 2*fw32, th + 2*fw32,
                     outer_r, fw32, inner_r, border_argb,
@@ -695,24 +721,19 @@ impl<'a> Switcher<'a> {
 
     fn draw_icon(
         &self,
-        win_pic: u32,
-        fmt: u32,
-        drawable: Window,
+        ctx: PictCtx,
+        tile: TileGeom,
         entry: &WindowEntry,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
         let icon_size = self.config.tile.icon_size;
         let pad = self.tile_pad();
         // Center icon horizontally within the padded inner region
-        let avail_w = tile_w.saturating_sub(2 * pad);
-        let icon_x = tile_x + (pad as i16) + (avail_w.saturating_sub(icon_size) / 2) as i16;
+        let avail_w = tile.w.saturating_sub(2 * pad);
+        let icon_x = tile.x + (pad as i16) + (avail_w.saturating_sub(icon_size) / 2) as i16;
         // Center icon vertically in the non-label area, respecting top/bottom padding
-        let avail_icon_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
-        let icon_y = tile_y + (pad as i16) + (avail_icon_h.saturating_sub(icon_size) / 2) as i16;
+        let avail_icon_h = tile.h.saturating_sub(LABEL_H + 2 * pad);
+        let icon_y = tile.y + (pad as i16) + (avail_icon_h.saturating_sub(icon_size) / 2) as i16;
 
         let (src_w, src_h, pixels) = match &entry.icon {
             Some(icon) => icon,
@@ -721,7 +742,7 @@ impl<'a> Switcher<'a> {
                 let (fr, fg_c, fb, fa) = argb_to_render_color(fg_argb);
                 self.conn.render_fill_rectangles(
                     PictOp::OVER,
-                    win_pic,
+                    ctx.pic,
                     RenderColor { red: fr, green: fg_c, blue: fb, alpha: fa },
                     &[Rectangle {
                         x: icon_x, y: icon_y,
@@ -735,7 +756,7 @@ impl<'a> Switcher<'a> {
 
         // Upload pixels into a 32-bit pixmap
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
 
         let gc = self.conn.generate_id()?;
         self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
@@ -755,7 +776,7 @@ impl<'a> Switcher<'a> {
 
         // Create an XRender Picture for the pixmap
         let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
         self.conn.free_pixmap(pixmap)?.check()?;
 
         // Scale to icon_size if the source dimensions differ
@@ -775,7 +796,7 @@ impl<'a> Switcher<'a> {
             PictOp::OVER,
             icon_pic,
             0u32,        // mask = None
-            win_pic,
+            ctx.pic,
             0, 0,        // src_x, src_y
             0, 0,        // mask_x, mask_y
             icon_x, icon_y,
@@ -791,15 +812,9 @@ impl<'a> Switcher<'a> {
     /// if the entry has no icon data or the overlay is disabled.
     fn draw_icon_overlay(
         &self,
-        pix_pic: u32,
-        argb_fmt: u32,
-        a8_fmt: u32,
-        drawable: Window,
+        ctx: PictCtx,
+        tile: TileGeom,
         entry: &WindowEntry,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
     ) -> Result<(), Box<dyn Error>> {
         let (src_w, src_h, pixels) = match &entry.icon {
             Some(icon) => icon,
@@ -810,18 +825,18 @@ impl<'a> Switcher<'a> {
 
         let ov_size = self.config.tile.icon_overlay_size.max(8);
         let pad = self.tile_pad();
-        let avail_w = tile_w.saturating_sub(2 * pad);
-        let avail_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
+        let avail_w = tile.w.saturating_sub(2 * pad);
+        let avail_h = tile.h.saturating_sub(LABEL_H + 2 * pad);
         if avail_w < ov_size || avail_h < ov_size { return Ok(()); }
 
         // Bottom-right corner of the content area, with a small inset margin.
         let margin = 6i16;
-        let ov_x = tile_x + pad as i16 + avail_w as i16 - ov_size as i16 - margin;
-        let ov_y = tile_y + pad as i16 + avail_h as i16 - ov_size as i16 - margin;
+        let ov_x = tile.x + pad as i16 + avail_w as i16 - ov_size as i16 - margin;
+        let ov_y = tile.y + pad as i16 + avail_h as i16 - ov_size as i16 - margin;
 
         // Upload icon pixels into a temporary pixmap.
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
         let gc = self.conn.generate_id()?;
         self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
@@ -830,7 +845,7 @@ impl<'a> Switcher<'a> {
         self.conn.free_gc(gc)?.check()?;
 
         let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, argb_fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
         self.conn.free_pixmap(pixmap)?.check()?;
 
         // Scale to ov_size if needed.
@@ -847,10 +862,10 @@ impl<'a> Switcher<'a> {
 
         // Build a 1×1 A8 alpha-mask picture with repeat, giving 80% opacity.
         let alpha_pix = self.conn.generate_id()?;
-        self.conn.create_pixmap(8, alpha_pix, drawable, 1, 1)?.check()?;
+        self.conn.create_pixmap(8, alpha_pix, ctx.drawable, 1, 1)?.check()?;
         let alpha_pic = self.conn.generate_id()?;
         self.conn.render_create_picture(
-            alpha_pic, alpha_pix, a8_fmt,
+            alpha_pic, alpha_pix, ctx.a8_fmt,
             &CreatePictureAux::new().repeat(Repeat::NORMAL),
         )?.check()?;
         self.conn.free_pixmap(alpha_pix)?.check()?;
@@ -863,7 +878,7 @@ impl<'a> Switcher<'a> {
         // Composite icon over the thumbnail with the alpha mask.
         self.conn.render_composite(
             PictOp::OVER,
-            icon_pic, alpha_pic, pix_pic,
+            icon_pic, alpha_pic, ctx.pic,
             0, 0, 0, 0,
             ov_x, ov_y,
             ov_size as u16, ov_size as u16,
@@ -879,23 +894,18 @@ impl<'a> Switcher<'a> {
     /// running, the window is not redirected, or any X11 call fails.
     fn draw_thumb(
         &self,
-        pix_pic: u32,
-        argb_fmt: u32,
-        drawable: Window,
+        ctx: PictCtx,
+        tile: TileGeom,
         entry: &WindowEntry,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
         fg_argb: u32,
         formats: &x11rb::protocol::render::QueryPictFormatsReply,
     ) -> Result<(), Box<dyn Error>> {
         let pad = self.tile_pad();
-        let avail_w = tile_w.saturating_sub(2 * pad);
-        let avail_h = tile_h.saturating_sub(LABEL_H + 2 * pad);
+        let avail_w = tile.w.saturating_sub(2 * pad);
+        let avail_h = tile.h.saturating_sub(LABEL_H + 2 * pad);
 
         if avail_w == 0 || avail_h == 0 {
-            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            return self.draw_icon(ctx, tile, entry, fg_argb);
         }
 
         // Use the pre-computed WM frame window (direct child of root).
@@ -910,10 +920,10 @@ impl<'a> Switcher<'a> {
             Some(v) => v,
             None => {
                 if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
-                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                        tile.x, tile.y, avail_w, avail_h, pad);
                 }
-                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+                return self.draw_icon(ctx, tile, entry, fg_argb);
             }
         };
 
@@ -925,10 +935,10 @@ impl<'a> Switcher<'a> {
         if !name_ok {
             // Window is likely on another desktop (unmapped). Try the pixel cache.
             if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
-                    cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                    tile.x, tile.y, avail_w, avail_h, pad);
             }
-            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            return self.draw_icon(ctx, tile, entry, fg_argb);
         }
 
         // Query actual window dimensions via the pixmap geometry.
@@ -937,17 +947,17 @@ impl<'a> Switcher<'a> {
             None => {
                 let _ = self.conn.free_pixmap(thumb_pix).ok();
                 if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
-                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                        tile.x, tile.y, avail_w, avail_h, pad);
                 }
-                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+                return self.draw_icon(ctx, tile, entry, fg_argb);
             }
         };
         let src_w = geom.width as u32;
         let src_h = geom.height as u32;
         if src_w == 0 || src_h == 0 {
             let _ = self.conn.free_pixmap(thumb_pix).ok();
-            return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+            return self.draw_icon(ctx, tile, entry, fg_argb);
         }
 
         // Find the XRender PictFormat that matches this window's visual.
@@ -956,10 +966,10 @@ impl<'a> Switcher<'a> {
             None => {
                 let _ = self.conn.free_pixmap(thumb_pix).ok();
                 if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(pix_pic, argb_fmt, drawable,
-                        cpixels, *cw, *ch, tile_x, tile_y, avail_w, avail_h, pad);
+                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                        tile.x, tile.y, avail_w, avail_h, pad);
                 }
-                return self.draw_icon(pix_pic, argb_fmt, drawable, entry, tile_x, tile_y, tile_w, tile_h, fg_argb);
+                return self.draw_icon(ctx, tile, entry, fg_argb);
             }
         };
 
@@ -975,8 +985,8 @@ impl<'a> Switcher<'a> {
         let dst_h = ((src_h as f64 / scale).round() as u32).max(1).min(avail_h);
 
         // Center the thumbnail within the available content area.
-        let dst_x = tile_x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
-        let dst_y = tile_y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
+        let dst_x = tile.x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
+        let dst_y = tile.y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
 
         // Set a bilinear scaling transform (16.16 fixed-point).
         let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
@@ -991,7 +1001,7 @@ impl<'a> Switcher<'a> {
         // Composite the thumbnail onto the off-screen buffer.
         self.conn.render_composite(
             PictOp::OVER,
-            thumb_pic, 0u32, pix_pic,
+            thumb_pic, 0u32, ctx.pic,
             0, 0,   // src_x, src_y
             0, 0,   // mask_x, mask_y
             dst_x, dst_y,
@@ -1006,12 +1016,9 @@ impl<'a> Switcher<'a> {
     /// Uses Xft (antialiased, Fontconfig names) when available, bitmap fonts as fallback.
     fn draw_label(
         &self,
-        win: Window,
+        drawable: Window,
         entry: &WindowEntry,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
+        tile: TileGeom,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
         let title = truncate_title(&entry.name, TITLE_MAX_CHARS);
@@ -1020,9 +1027,9 @@ impl<'a> Switcher<'a> {
         }
 
         if let Some(ref xft) = self.xft {
-            self.draw_label_xft(xft, win, &title, tile_x, tile_y, tile_w, tile_h, fg_argb)
+            self.draw_label_xft(xft, drawable, &title, tile, fg_argb)
         } else {
-            self.draw_label_bitmap(win, &title, tile_x, tile_y, tile_w, tile_h, fg_argb)
+            self.draw_label_bitmap(drawable, &title, tile, fg_argb)
         }
     }
 
@@ -1031,10 +1038,7 @@ impl<'a> Switcher<'a> {
         xst: &xh::XftState,
         win: Window,
         title: &str,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
+        tile: TileGeom,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
         use std::ffi::CString;
@@ -1063,14 +1067,14 @@ impl<'a> Switcher<'a> {
         // h_pad = 10px base + tile_padding for horizontal inset; v_pad for vertical.
         let h_pad = 10u32.saturating_add(self.tile_pad());
         let v_pad = self.tile_pad();
-        let inner_w = tile_w.saturating_sub(2 * h_pad);
+        let inner_w = tile.w.saturating_sub(2 * h_pad);
         let lines = wrap_text_xft(xst.display, font, title, inner_w);
 
         let line_h = unsafe { (*font).height.max(1) } as u32;
         let ascent = unsafe { (*font).ascent.max(0) } as i16;
 
         // Label area starts LABEL_H + v_pad px from the tile bottom
-        let label_top = tile_y + (tile_h.saturating_sub(LABEL_H + v_pad)) as i16;
+        let label_top = tile.y + (tile.h.saturating_sub(LABEL_H + v_pad)) as i16;
 
         // How many lines actually fit in LABEL_H
         let max_lines = (LABEL_H / line_h).max(1) as usize;
@@ -1115,7 +1119,7 @@ impl<'a> Switcher<'a> {
                 );
             }
             let text_w = extents.xOff.max(0) as u32;
-            let x = tile_x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
+            let x = tile.x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
             let y = label_top + ascent + (i as u32 * line_h) as i16;
 
             // Shadow pass (drawn first so it appears behind the main text).
@@ -1157,10 +1161,7 @@ impl<'a> Switcher<'a> {
         &self,
         win: Window,
         title: &str,
-        tile_x: i16,
-        tile_y: i16,
-        tile_w: u32,
-        tile_h: u32,
+        tile: TileGeom,
         fg_argb: u32,
     ) -> Result<(), Box<dyn Error>> {
         let title_bytes = title.as_bytes();
@@ -1176,9 +1177,9 @@ impl<'a> Switcher<'a> {
 
         let h_pad = 10u32.saturating_add(self.tile_pad());
         let v_pad = self.tile_pad();
-        let inner_w = tile_w.saturating_sub(2 * h_pad);
-        let label_x = tile_x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
-        let label_y = tile_y + tile_h as i16 - 4 - v_pad as i16;
+        let inner_w = tile.w.saturating_sub(2 * h_pad);
+        let label_x = tile.x + (h_pad as i16) + (inner_w.saturating_sub(text_w) / 2) as i16;
+        let label_y = tile.y + tile.h as i16 - 4 - v_pad as i16;
 
         let gc = self.conn.generate_id()?;
         self.conn.create_gc(gc, win, &CreateGCAux::new()
@@ -1471,6 +1472,19 @@ impl<'a> Switcher<'a> {
         if self.debug {
             eprintln!("[hop] cache_thumb({frame_win:#x}): {w}x{h} depth={depth} → stored {store_w}x{store_h}");
         }
+        // Evict stale entries before inserting to keep the cache bounded.
+        if self.thumb_cache.len() >= MAX_THUMB_CACHE {
+            let live: std::collections::HashSet<Window> =
+                self.windows.iter().map(|e| e.frame).collect();
+            self.thumb_cache.retain(|k, _| live.contains(k));
+            // If the cache is still at capacity (all entries are live windows),
+            // remove one arbitrary entry to make room.
+            if self.thumb_cache.len() >= MAX_THUMB_CACHE {
+                if let Some(k) = self.thumb_cache.keys().next().copied() {
+                    self.thumb_cache.remove(&k);
+                }
+            }
+        }
         self.thumb_cache.insert(frame_win, (store_w, store_h, pixels));
     }
 
@@ -1484,9 +1498,7 @@ impl<'a> Switcher<'a> {
     /// Used to render cached thumbnails for off-desktop windows.
     fn draw_pixels_scaled(
         &self,
-        pix_pic: u32,
-        argb_fmt: u32,
-        drawable: Window,
+        ctx: PictCtx,
         pixels: &[u32],
         src_w: u32,
         src_h: u32,
@@ -1499,7 +1511,7 @@ impl<'a> Switcher<'a> {
         if src_w == 0 || src_h == 0 { return Ok(()); }
 
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
         let gc = self.conn.generate_id()?;
         self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
@@ -1510,7 +1522,7 @@ impl<'a> Switcher<'a> {
         self.conn.free_gc(gc)?.check()?;
 
         let pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(pic, pixmap, argb_fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.render_create_picture(pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
         self.conn.free_pixmap(pixmap)?.check()?;
 
         let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
@@ -1529,7 +1541,7 @@ impl<'a> Switcher<'a> {
         self.conn.render_set_picture_filter(pic, b"bilinear", &[])?.check()?;
 
         self.conn.render_composite(
-            PictOp::OVER, pic, 0u32, pix_pic,
+            PictOp::OVER, pic, 0u32, ctx.pic,
             0, 0, 0, 0, dst_x, dst_y, dst_w as u16, dst_h as u16,
         )?.check()?;
         self.conn.render_free_picture(pic)?.check()?;
@@ -1931,10 +1943,7 @@ fn fill_rounded_rect_to_gc(
 /// When `radius == 0` falls back to a plain `render_fill_rectangles` call.
 fn draw_filled_rounded_rect(
     conn: &RustConnection,
-    dst_pic: u32,
-    argb_fmt: u32,
-    a8_fmt: u32,
-    drawable: u32,
+    ctx: PictCtx,
     x: i16,
     y: i16,
     w: u32,
@@ -1949,7 +1958,7 @@ fn draw_filled_rounded_rect(
     if radius == 0 {
         let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
         conn.render_fill_rectangles(
-            PictOp::OVER, dst_pic,
+            PictOp::OVER, ctx.pic,
             RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
             &[Rectangle { x, y, width: wu, height: hu }],
         )?.check()?;
@@ -1957,7 +1966,7 @@ fn draw_filled_rounded_rect(
     }
 
     let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, drawable, wu, hu)?.check()?;
+    conn.create_pixmap(8, mask_pix, ctx.drawable, wu, hu)?.check()?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
     conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?.check()?;
@@ -1965,7 +1974,7 @@ fn draw_filled_rounded_rect(
     fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, wu, hu, radius)?;
     conn.free_gc(gc)?.check()?;
 
-    composite_color_through_mask(conn, dst_pic, argb_fmt, a8_fmt, drawable, x, y, wu, hu, mask_pix, color_argb)?;
+    composite_color_through_mask(conn, ctx, x, y, wu, hu, mask_pix, color_argb)?;
     conn.free_pixmap(mask_pix)?.check()?;
     Ok(())
 }
@@ -1978,10 +1987,7 @@ fn draw_filled_rounded_rect(
 /// (typically `outer_r - fw`, or 0 when `outer_r <= fw`).
 fn draw_border_ring(
     conn: &RustConnection,
-    dst_pic: u32,
-    argb_fmt: u32,
-    a8_fmt: u32,
-    drawable: u32,
+    ctx: PictCtx,
     ox: i16,
     oy: i16,
     ow: u32,
@@ -1996,7 +2002,7 @@ fn draw_border_ring(
     let ohu = oh as u16;
 
     let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, drawable, owu, ohu)?.check()?;
+    conn.create_pixmap(8, mask_pix, ctx.drawable, owu, ohu)?.check()?;
     let gc = conn.generate_id()?;
     conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
     // Clear mask to 0.
@@ -2013,20 +2019,17 @@ fn draw_border_ring(
     }
     conn.free_gc(gc)?.check()?;
 
-    composite_color_through_mask(conn, dst_pic, argb_fmt, a8_fmt, drawable, ox, oy, owu, ohu, mask_pix, color_argb)?;
+    composite_color_through_mask(conn, ctx, ox, oy, owu, ohu, mask_pix, color_argb)?;
     conn.free_pixmap(mask_pix)?.check()?;
     Ok(())
 }
 
-/// Composite `color_argb` through an existing A8 `mask_pix` onto `dst_pic` using OVER.
+/// Composite `color_argb` through an existing A8 `mask_pix` onto `ctx.pic` using OVER.
 /// Creates a temporary 1×1 repeated source and frees it afterwards.
 /// Does NOT free `mask_pix` — the caller is responsible for that.
 fn composite_color_through_mask(
     conn: &RustConnection,
-    dst_pic: u32,
-    argb_fmt: u32,
-    a8_fmt: u32,
-    drawable: u32,
+    ctx: PictCtx,
     x: i16,
     y: i16,
     w: u16,
@@ -2035,12 +2038,12 @@ fn composite_color_through_mask(
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
     let mask_pic = conn.generate_id()?;
-    conn.render_create_picture(mask_pic, mask_pix, a8_fmt, &CreatePictureAux::new())?.check()?;
+    conn.render_create_picture(mask_pic, mask_pix, ctx.a8_fmt, &CreatePictureAux::new())?.check()?;
 
     let src_pix = conn.generate_id()?;
-    conn.create_pixmap(32, src_pix, drawable, 1, 1)?.check()?;
+    conn.create_pixmap(32, src_pix, ctx.drawable, 1, 1)?.check()?;
     let src_pic = conn.generate_id()?;
-    conn.render_create_picture(src_pic, src_pix, argb_fmt,
+    conn.render_create_picture(src_pic, src_pix, ctx.argb_fmt,
         &CreatePictureAux::new().repeat(Repeat::NORMAL))?.check()?;
     conn.free_pixmap(src_pix)?.check()?;
 
@@ -2053,7 +2056,7 @@ fn composite_color_through_mask(
 
     conn.render_composite(
         PictOp::OVER,
-        src_pic, mask_pic, dst_pic,
+        src_pic, mask_pic, ctx.pic,
         0, 0,  // src x, y  (1×1 with repeat)
         0, 0,  // mask x, y
         x, y,  // dst x, y
