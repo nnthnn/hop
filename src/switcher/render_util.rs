@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, Arc, CreateGCAux, ChangeGCAux, Rectangle, Visualid};
+use x11rb::protocol::xproto::{self, ConnectionExt as _, Arc, CreateGCAux, ChangeGCAux, Rectangle};
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt,
     Color as RenderColor,
@@ -46,37 +46,47 @@ pub(super) fn downscale_argb(pixels: &[u32], src_w: u32, src_h: u32, dst_w: u32,
     out
 }
 
-/// Walk up the window hierarchy to find the WM frame: the direct child of root
-/// that contains `client`. Compositors redirect only direct children of root,
-/// so NameWindowPixmap must be called on the frame, not the client window.
-pub(super) fn find_frame_win(conn: &RustConnection, client: xproto::Window, root: xproto::Window) -> xproto::Window {
-    let mut w = client;
-    loop {
-        match conn.query_tree(w).ok().and_then(|c| c.reply().ok()) {
-            Some(t) if t.parent == root || t.parent == 0 => return w,
-            Some(t) if t.parent != w => w = t.parent,
-            _ => return client,
-        }
-    }
-}
+/// Resolve the WM frame for each client window: the direct child of root that
+/// contains it. Compositors redirect only direct children of root, so
+/// NameWindowPixmap must target the frame, not the client window.
+///
+/// Each level of the hierarchy walk issues one `query_tree` per still-unresolved
+/// client and collects the replies together, so N clients cost ~depth round-trips
+/// instead of N×depth. Clients that fail to resolve fall back to themselves.
+pub(super) fn find_frames_batched(
+    conn: &RustConnection,
+    clients: &[xproto::Window],
+    root: xproto::Window,
+) -> Vec<xproto::Window> {
+    let n = clients.len();
+    let mut result: Vec<xproto::Window> = clients.to_vec(); // fallback = client itself
+    let mut done: Vec<bool> = vec![false; n];
+    let mut cur: Vec<xproto::Window> = clients.to_vec();     // window under inspection
 
-/// Find the XRender PictFormat ID for the given visual on the given screen.
-/// Used to create a Picture from a composite backing pixmap whose depth may differ
-/// from our ARGB32 popup (e.g., a 24-bit window has a 24-bit format).
-pub(super) fn find_format_for_visual(
-    formats: &x11rb::protocol::render::QueryPictFormatsReply,
-    visual_id: Visualid,
-    screen_num: usize,
-) -> Option<u32> {
-    let screen = formats.screens.get(screen_num)?;
-    for depth in &screen.depths {
-        for visual in &depth.visuals {
-            if visual.visual == visual_id {
-                return Some(visual.format);
+    // Bound the walk defensively against deep hierarchies or cycles.
+    for _ in 0..32 {
+        // Fire off query_tree for every still-active client, then collect replies.
+        let cookies: Vec<_> = (0..n)
+            .map(|i| if done[i] { None } else { conn.query_tree(cur[i]).ok() })
+            .collect();
+        let mut any_active = false;
+        for (i, cookie) in cookies.into_iter().enumerate() {
+            if done[i] { continue; }
+            match cookie.and_then(|c| c.reply().ok()) {
+                Some(t) if t.parent == root || t.parent == 0 => {
+                    result[i] = cur[i];
+                    done[i] = true;
+                }
+                Some(t) if t.parent != cur[i] => {
+                    cur[i] = t.parent;
+                    any_active = true;
+                }
+                _ => done[i] = true,
             }
         }
+        if !any_active { break; }
     }
-    None
+    result
 }
 
 /// Find the XRender A8 (8-bit alpha-only) picture format.
@@ -108,7 +118,7 @@ pub(super) fn fill_rounded_rect_to_gc(
 ) -> Result<(), Box<dyn Error>> {
     let r = (radius as u16).min(w / 2).min(h / 2);
     if r == 0 {
-        conn.poly_fill_rectangle(pix, gc, &[Rectangle { x, y, width: w, height: h }])?.check()?;
+        conn.poly_fill_rectangle(pix, gc, &[Rectangle { x, y, width: w, height: h }])?;
         return Ok(());
     }
     let r2 = r * 2;
@@ -116,13 +126,13 @@ pub(super) fn fill_rounded_rect_to_gc(
         Rectangle { x: x + r as i16,           y,               width: w - r2, height: h      },
         Rectangle { x,                          y: y + r as i16, width: r,      height: h - r2 },
         Rectangle { x: x + (w - r) as i16,     y: y + r as i16, width: r,      height: h - r2 },
-    ])?.check()?;
+    ])?;
     conn.poly_fill_arc(pix, gc, &[
         Arc { x,                     y,                     width: r2, height: r2, angle1: 90*64,  angle2: 90*64 }, // top-left
         Arc { x: x+(w-r2) as i16,   y,                     width: r2, height: r2, angle1: 0,      angle2: 90*64 }, // top-right
         Arc { x: x+(w-r2) as i16,   y: y+(h-r2) as i16,   width: r2, height: r2, angle1: 17280,  angle2: 90*64 }, // bottom-right (270*64)
         Arc { x,                     y: y+(h-r2) as i16,   width: r2, height: r2, angle1: 180*64, angle2: 90*64 }, // bottom-left
-    ])?.check()?;
+    ])?;
     Ok(())
 }
 
@@ -149,21 +159,21 @@ pub(super) fn draw_filled_rounded_rect(
             PictOp::OVER, ctx.pic,
             RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
             &[Rectangle { x, y, width: wu, height: hu }],
-        )?.check()?;
+        )?;
         return Ok(());
     }
 
     let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, ctx.drawable, wu, hu)?.check()?;
+    conn.create_pixmap(8, mask_pix, ctx.drawable, wu, hu)?;
     let gc = conn.generate_id()?;
-    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
-    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?.check()?;
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?;
+    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?;
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?;
     fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, wu, hu, radius)?;
-    conn.free_gc(gc)?.check()?;
+    conn.free_gc(gc)?;
 
     composite_color_through_mask(conn, ctx, x, y, wu, hu, mask_pix, color_argb)?;
-    conn.free_pixmap(mask_pix)?.check()?;
+    conn.free_pixmap(mask_pix)?;
     Ok(())
 }
 
@@ -190,25 +200,25 @@ pub(super) fn draw_border_ring(
     let ohu = oh as u16;
 
     let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, ctx.drawable, owu, ohu)?.check()?;
+    conn.create_pixmap(8, mask_pix, ctx.drawable, owu, ohu)?;
     let gc = conn.generate_id()?;
-    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?.check()?;
+    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?;
     // Clear mask to 0.
-    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?.check()?;
+    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?;
     // Paint outer rounded rect with 255.
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?;
     fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, owu, ohu, outer_r)?;
     // Punch out inner rounded rect with 0.
     let iw = ow.saturating_sub(2 * fw) as u16;
     let ih = oh.saturating_sub(2 * fw) as u16;
     if iw > 0 && ih > 0 {
-        conn.change_gc(gc, &ChangeGCAux::new().foreground(0u32))?.check()?;
+        conn.change_gc(gc, &ChangeGCAux::new().foreground(0u32))?;
         fill_rounded_rect_to_gc(conn, mask_pix, gc, fw as i16, fw as i16, iw, ih, inner_r)?;
     }
-    conn.free_gc(gc)?.check()?;
+    conn.free_gc(gc)?;
 
     composite_color_through_mask(conn, ctx, ox, oy, owu, ohu, mask_pix, color_argb)?;
-    conn.free_pixmap(mask_pix)?.check()?;
+    conn.free_pixmap(mask_pix)?;
     Ok(())
 }
 
@@ -226,21 +236,21 @@ pub(super) fn composite_color_through_mask(
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
     let mask_pic = conn.generate_id()?;
-    conn.render_create_picture(mask_pic, mask_pix, ctx.a8_fmt, &CreatePictureAux::new())?.check()?;
+    conn.render_create_picture(mask_pic, mask_pix, ctx.a8_fmt, &CreatePictureAux::new())?;
 
     let src_pix = conn.generate_id()?;
-    conn.create_pixmap(32, src_pix, ctx.drawable, 1, 1)?.check()?;
+    conn.create_pixmap(32, src_pix, ctx.drawable, 1, 1)?;
     let src_pic = conn.generate_id()?;
     conn.render_create_picture(src_pic, src_pix, ctx.argb_fmt,
-        &CreatePictureAux::new().repeat(Repeat::NORMAL))?.check()?;
-    conn.free_pixmap(src_pix)?.check()?;
+        &CreatePictureAux::new().repeat(Repeat::NORMAL))?;
+    conn.free_pixmap(src_pix)?;
 
     let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
     conn.render_fill_rectangles(
         PictOp::SRC, src_pic,
         RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
         &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
-    )?.check()?;
+    )?;
 
     conn.render_composite(
         PictOp::OVER,
@@ -249,10 +259,10 @@ pub(super) fn composite_color_through_mask(
         0, 0,  // mask x, y
         x, y,  // dst x, y
         w, h,
-    )?.check()?;
+    )?;
 
-    conn.render_free_picture(src_pic)?.check()?;
-    conn.render_free_picture(mask_pic)?.check()?;
+    conn.render_free_picture(src_pic)?;
+    conn.render_free_picture(mask_pic)?;
     Ok(())
 }
 

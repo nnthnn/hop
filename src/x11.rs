@@ -56,6 +56,69 @@ impl Drop for XftState {
     }
 }
 
+/// All EWMH/ICCCM atoms hop interns, resolved once at connection time.
+///
+/// Atoms never change for the lifetime of an X11 connection, so interning them
+/// repeatedly (as the old per-call `intern_atom` helpers did) wasted one blocking
+/// round-trip per name per window. `load_windows` alone interned ~10 atoms per
+/// window; caching them here removes that entire class of round-trips.
+#[derive(Clone, Copy)]
+pub struct Atoms {
+    pub net_client_list_stacking: u32,
+    pub net_client_list: u32,
+    pub net_wm_window_type: u32,
+    pub wt_desktop: u32,
+    pub wt_dock: u32,
+    pub wt_toolbar: u32,
+    pub wt_splash: u32,
+    pub wt_notification: u32,
+    pub net_wm_name: u32,
+    pub utf8_string: u32,
+    pub net_wm_icon: u32,
+}
+
+impl Atoms {
+    /// Intern every atom in one pipelined batch: issue all `InternAtom` requests
+    /// first, then collect the replies, so the whole set costs ~1 round-trip.
+    pub fn intern(conn: &RustConnection) -> Result<Self, Box<dyn Error>> {
+        let names: &[&str] = &[
+            "_NET_CLIENT_LIST_STACKING",
+            "_NET_CLIENT_LIST",
+            "_NET_WM_WINDOW_TYPE",
+            "_NET_WM_WINDOW_TYPE_DESKTOP",
+            "_NET_WM_WINDOW_TYPE_DOCK",
+            "_NET_WM_WINDOW_TYPE_TOOLBAR",
+            "_NET_WM_WINDOW_TYPE_SPLASH",
+            "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+            "_NET_WM_NAME",
+            "UTF8_STRING",
+            "_NET_WM_ICON",
+        ];
+        // Phase 1: fire off all requests without waiting.
+        let cookies: Vec<_> = names.iter()
+            .map(|n| conn.intern_atom(false, n.as_bytes()))
+            .collect::<Result<_, _>>()?;
+        // Phase 2: collect replies (pipelined by the server).
+        let mut a = [0u32; 11];
+        for (i, c) in cookies.into_iter().enumerate() {
+            a[i] = c.reply()?.atom;
+        }
+        Ok(Atoms {
+            net_client_list_stacking: a[0],
+            net_client_list:          a[1],
+            net_wm_window_type:       a[2],
+            wt_desktop:               a[3],
+            wt_dock:                  a[4],
+            wt_toolbar:               a[5],
+            wt_splash:                a[6],
+            wt_notification:          a[7],
+            net_wm_name:              a[8],
+            utf8_string:              a[9],
+            net_wm_icon:              a[10],
+        })
+    }
+}
+
 pub struct Display {
     pub conn: RustConnection,
     pub screen_num: usize,
@@ -64,6 +127,7 @@ pub struct Display {
     pub screen_height: u16,
     pub argb_visual: Option<Visualid>,
     pub argb_colormap: Option<u32>,
+    pub atoms: Atoms,
 }
 
 impl Display {
@@ -75,6 +139,7 @@ impl Display {
         let screen_height = screen.height_in_pixels;
 
         let (argb_visual, argb_colormap) = find_argb_visual(&conn, screen)?;
+        let atoms = Atoms::intern(&conn)?;
 
         Ok(Display {
             conn,
@@ -84,6 +149,7 @@ impl Display {
             screen_height,
             argb_visual,
             argb_colormap,
+            atoms,
         })
     }
 
@@ -235,14 +301,13 @@ fn keysym_to_keycode(conn: &RustConnection, keysym: u32) -> Result<Option<Keycod
 pub fn get_window_list(
     conn: &RustConnection,
     root: Window,
+    atoms: &Atoms,
 ) -> Result<Vec<Window>, Box<dyn Error>> {
-    let atom = intern_atom(conn, "_NET_CLIENT_LIST_STACKING")?;
-    if atom == 0 {
+    if atoms.net_client_list_stacking == 0 {
         // Fall back to _NET_CLIENT_LIST
-        let atom2 = intern_atom(conn, "_NET_CLIENT_LIST")?;
-        return get_window_list_atom(conn, root, atom2);
+        return get_window_list_atom(conn, root, atoms.net_client_list);
     }
-    get_window_list_atom(conn, root, atom)
+    get_window_list_atom(conn, root, atoms.net_client_list_stacking)
 }
 
 fn get_window_list_atom(
@@ -271,43 +336,9 @@ fn get_window_list_atom(
     Ok(windows.into_iter().rev().collect())
 }
 
-/// Get a window's _NET_WM_NAME or WM_NAME.
-pub fn get_window_name(conn: &RustConnection, window: Window) -> Result<String, Box<dyn Error>> {
-    let net_wm_name = intern_atom(conn, "_NET_WM_NAME")?;
-    let utf8_string = intern_atom(conn, "UTF8_STRING")?;
-
-    let reply = conn.get_property(false, window, net_wm_name, utf8_string, 0, 256)?.reply();
-    if let Ok(r) = reply {
-        if !r.value.is_empty() {
-            return Ok(String::from_utf8_lossy(&r.value).into_owned());
-        }
-    }
-
-    // Fall back to WM_NAME
-    let reply = conn.get_property(
-        false, window,
-        AtomEnum::WM_NAME,
-        AtomEnum::STRING,
-        0, 256,
-    )?.reply()?;
-    Ok(String::from_utf8_lossy(&reply.value).into_owned())
-}
-
-/// Get _NET_WM_ICON raw ARGB data, picking the best size for `target_size`.
-pub fn get_window_icon(
-    conn: &RustConnection,
-    window: Window,
-    target_size: u32,
-) -> Result<Option<(u32, u32, Vec<u32>)>, Box<dyn Error>> {
-    let atom = intern_atom(conn, "_NET_WM_ICON")?;
-    let reply = conn.get_property(false, window, atom, AtomEnum::CARDINAL, 0, u32::MAX / 4)?
-        .reply()?;
-
-    if reply.format != 32 || reply.value.is_empty() {
-        return Ok(None);
-    }
-
-    let data: Vec<u32> = reply.value32().unwrap().collect();
+/// Pick the best-matching icon from raw `_NET_WM_ICON` CARDINAL data for
+/// `target_size`. The property is a sequence of `[w, h, w*h ARGB pixels]` blocks.
+pub fn parse_net_wm_icon(data: &[u32], target_size: u32) -> Option<(u32, u32, Vec<u32>)> {
     let mut i = 0;
     let mut best: Option<(u32, u32, usize)> = None; // (w, h, offset)
 
@@ -329,12 +360,10 @@ pub fn get_window_icon(
         i += (w * h) as usize;
     }
 
-    if let Some((w, h, offset)) = best {
+    best.map(|(w, h, offset)| {
         let pixels = data[offset..offset + (w * h) as usize].to_vec();
-        Ok(Some((w, h, pixels)))
-    } else {
-        Ok(None)
-    }
+        (w, h, pixels)
+    })
 }
 
 /// Hint to the compositor (picom/KWin) to blur behind specific regions of this window.
@@ -391,52 +420,23 @@ pub fn set_skip_taskbar(conn: &RustConnection, window: Window) -> Result<(), Box
     Ok(())
 }
 
-/// Return true if the window should be excluded from the switcher.
-/// Filters out panels, docks, the desktop, splashes, and notification windows.
-pub fn should_skip_window(conn: &RustConnection, window: Window) -> bool {
-    let Ok(wt_atom) = intern_atom(conn, "_NET_WM_WINDOW_TYPE") else { return false; };
-    if wt_atom == 0 {
-        return false;
-    }
-    let Ok(cookie) = conn.get_property(false, window, wt_atom, AtomEnum::ATOM, 0, 32) else {
-        return false;
-    };
-    let Ok(reply) = cookie.reply() else {
-        return false;
-    };
-    if reply.format != 32 {
-        return false;
-    }
-    let window_types: Vec<u32> = reply.value32().unwrap().collect();
-
-    for type_name in &[
-        "_NET_WM_WINDOW_TYPE_DESKTOP",
-        "_NET_WM_WINDOW_TYPE_DOCK",
-        "_NET_WM_WINDOW_TYPE_TOOLBAR",
-        "_NET_WM_WINDOW_TYPE_SPLASH",
-        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
-    ] {
-        if let Ok(atom) = intern_atom(conn, type_name) {
-            if atom != 0 && window_types.contains(&atom) {
-                return true;
-            }
-        }
-    }
-    false
+/// Return true if any window type in `window_types` marks a window hop should
+/// skip: panels, docks, the desktop, splashes, and notification windows.
+/// Operates on already-fetched `_NET_WM_WINDOW_TYPE` atoms (see `load_windows`).
+pub fn is_skip_window_type(window_types: &[u32], atoms: &Atoms) -> bool {
+    window_types.iter().any(|&t| {
+        t == atoms.wt_desktop || t == atoms.wt_dock || t == atoms.wt_toolbar
+            || t == atoms.wt_splash || t == atoms.wt_notification
+    })
 }
 
-/// Get the WM_CLASS class component (the second null-terminated string) for a window.
-pub fn get_wm_class(conn: &RustConnection, window: Window) -> Option<String> {
-    let reply = conn
-        .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-        .ok()?
-        .reply()
-        .ok()?;
-    if reply.value.is_empty() {
+/// Parse the class component out of raw `WM_CLASS` property bytes.
+/// `WM_CLASS` is `"instance\0class\0"`; we want the class (second part).
+pub fn parse_wm_class(value: &[u8]) -> Option<String> {
+    if value.is_empty() {
         return None;
     }
-    // WM_CLASS = "instance\0class\0" — we want the class (second part)
-    let parts: Vec<&[u8]> = reply.value.splitn(3, |&b| b == 0).collect();
+    let parts: Vec<&[u8]> = value.splitn(3, |&b| b == 0).collect();
     let class_bytes = if parts.len() >= 2 && !parts[1].is_empty() {
         parts[1]
     } else {

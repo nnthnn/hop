@@ -7,7 +7,7 @@ mod render_util;
 use icons::load_icon_file;
 use text_util::{open_core_font, truncate_title, wrap_text_xft, resolve_shadow_color};
 use render_util::{
-    downscale_argb, find_frame_win, find_format_for_visual, find_a8_format,
+    downscale_argb, find_frames_batched, find_a8_format,
     fill_rounded_rect_to_gc, draw_filled_rounded_rect, draw_border_ring,
     argb_to_render_color,
 };
@@ -78,6 +78,8 @@ pub struct Switcher<'a> {
     screen_w: u16,
     screen_h: u16,
     screen_num: usize,
+    /// EWMH atoms interned once at startup (see x11::Atoms).
+    atoms: xh::Atoms,
     xft: Option<xh::XftState>,
     /// Persistent off-screen buffer kept alive for the whole popup session.
     /// Reusing the same pixmap avoids allocation overhead and prevents picom
@@ -97,9 +99,16 @@ pub struct Switcher<'a> {
     /// Used as fallback when a window is on another desktop and its compositor backing
     /// pixmap is unavailable (NameWindowPixmap returns BadMatch for unmapped windows).
     thumb_cache: HashMap<Window, (u32, u32, Vec<u32>)>,
-    /// Frames still waiting for a thumbnail to be fetched (progressive loading).
-    /// Populated by show(); drained one entry per event-loop iteration by pump_one_thumb().
-    thumb_queue: VecDeque<Window>,
+    /// Window indices still waiting to be enriched (icon fetch + thumbnail capture).
+    /// Populated by show(); drained one entry per event-loop iteration by
+    /// pump_one_enrich(). This is the "enrich after a tick" phase: the popup paints
+    /// immediately with backgrounds/borders/labels, then icons and thumbnails
+    /// stream in one window at a time without blocking input.
+    enrich_queue: VecDeque<usize>,
+    /// XRender pict-formats reply, fetched once and reused. The reply is large and
+    /// never changes for the connection, so caching it avoids a big round-trip on
+    /// every redraw — notably once per thumbnail during progressive loading.
+    cached_formats: Option<std::rc::Rc<x11rb::protocol::render::QueryPictFormatsReply>>,
 }
 
 impl<'a> Switcher<'a> {
@@ -133,6 +142,7 @@ impl<'a> Switcher<'a> {
             screen_w: display.screen_width,
             screen_h: display.screen_height,
             screen_num: display.screen_num,
+            atoms: display.atoms,
             xft,
             pix_buf: None,
             win_mask_pic: None,
@@ -141,40 +151,118 @@ impl<'a> Switcher<'a> {
             cached_win_bg: 0,
             debug: std::env::var("HOP_DEBUG").is_ok(),
             thumb_cache: HashMap::new(),
-            thumb_queue: VecDeque::new(),
+            enrich_queue: VecDeque::new(),
+            cached_formats: None,
         })
     }
 
     /// Populate the window list from EWMH. Skip the switcher popup itself.
+    ///
+    /// Only the cheap metadata needed for the first paint is fetched here —
+    /// window type (skip filter) and title — and both are pipelined (all requests
+    /// issued up front, replies collected afterward, ~1 round-trip total). Icons
+    /// are deliberately NOT fetched: `_NET_WM_ICON` ships every icon size and
+    /// transferring all of them for every window dominated popup-open latency.
+    /// Icons load progressively afterward via `pump_one_enrich` (off the critical
+    /// path), exactly like thumbnails.
     pub fn load_windows(&mut self, root: Window) -> Result<(), Box<dyn Error>> {
-        let win_ids = xh::get_window_list(self.conn, root)?;
+        let win_ids = xh::get_window_list(self.conn, root, &self.atoms)?;
         self.windows.clear();
 
-        // Extract fields so the loop body can push to self.windows without a borrow conflict.
+        // Copy out the borrowed/Copy state so the loop can push to self.windows
+        // without holding an immutable borrow of self.
         let conn = self.conn;
-        let icon_size = self.config.tile.icon_size;
+        let atoms = self.atoms;
+        let want_thumbs = self.config.tile.content == "thumbnail";
+
+        // Phase 1: fire off type + name requests without waiting for any reply.
+        let mut ids: Vec<Window> = Vec::with_capacity(win_ids.len());
+        let mut type_cookies     = Vec::with_capacity(win_ids.len());
+        let mut net_name_cookies = Vec::with_capacity(win_ids.len());
+        let mut wm_name_cookies  = Vec::with_capacity(win_ids.len());
 
         for id in win_ids {
             if self.popup == Some(id) {
                 continue;
             }
+            ids.push(id);
+            type_cookies.push(conn.get_property(false, id, atoms.net_wm_window_type, AtomEnum::ATOM, 0, 32)?);
+            net_name_cookies.push(conn.get_property(false, id, atoms.net_wm_name, atoms.utf8_string, 0, 256)?);
+            wm_name_cookies.push(conn.get_property(false, id, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)?);
+        }
+
+        // Phase 2: collect replies in lockstep and build the kept entries.
+        let mut type_it = type_cookies.into_iter();
+        let mut net_it  = net_name_cookies.into_iter();
+        let mut wmn_it  = wm_name_cookies.into_iter();
+
+        // (id, name) for windows that pass the skip filter; icons fill in later.
+        let mut kept: Vec<(Window, String)> = Vec::new();
+
+        for &id in &ids {
+            let type_c = type_it.next().unwrap();
+            let net_c  = net_it.next().unwrap();
+            let wmn_c  = wmn_it.next().unwrap();
+
             // Skip panels, docks, desktop windows, etc.
-            if xh::should_skip_window(conn, id) {
+            let types: Vec<u32> = type_c.reply().ok()
+                .filter(|r| r.format == 32)
+                .and_then(|r| r.value32().map(|it| it.collect()))
+                .unwrap_or_default();
+            if xh::is_skip_window_type(&types, &atoms) {
                 continue;
             }
-            let name = xh::get_window_name(conn, id).unwrap_or_default();
-            let icon = xh::get_window_icon(conn, id, icon_size).unwrap_or(None);
-            // If _NET_WM_ICON is absent, fall back to the XDG icon theme via WM_CLASS.
-            let icon = if icon.is_none() {
-                xh::get_wm_class(conn, id)
-                    .and_then(|cls| load_icon_file(&cls, icon_size))
-            } else {
-                icon
-            };
-            let frame = find_frame_win(conn, id, root);
-            self.windows.push(WindowEntry { id, name, icon, frame });
+
+            // Name: prefer _NET_WM_NAME, fall back to WM_NAME. (Unread cookies are
+            // dropped, which discards their replies — no extra round-trips.)
+            let name = net_c.reply().ok()
+                .filter(|r| !r.value.is_empty())
+                .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+                .or_else(|| wmn_c.reply().ok()
+                    .map(|r| String::from_utf8_lossy(&r.value).into_owned()))
+                .unwrap_or_default();
+
+            kept.push((id, name));
+        }
+
+        // Resolve WM frames only for kept windows, and only in thumbnail mode
+        // (the frame is unused for icon tiles). Batched to keep it cheap.
+        let kept_ids: Vec<Window> = kept.iter().map(|(id, _)| *id).collect();
+        let frames = if want_thumbs {
+            find_frames_batched(conn, &kept_ids, root)
+        } else {
+            kept_ids
+        };
+
+        for ((id, name), frame) in kept.into_iter().zip(frames) {
+            self.windows.push(WindowEntry { id, name, icon: None, frame });
         }
         Ok(())
+    }
+
+    /// Fetch one window's icon synchronously: prefer `_NET_WM_ICON`, fall back to
+    /// the XDG icon theme via `WM_CLASS`. Returns None if neither yields an icon.
+    /// Called off the critical path by the progressive enrich pump.
+    fn fetch_icon(&self, id: Window) -> Option<(u32, u32, Vec<u32>)> {
+        let icon_size = self.config.tile.icon_size;
+        // _NET_WM_ICON (raw ARGB, all sizes — we pick the best match).
+        let from_prop = self.conn
+            .get_property(false, id, self.atoms.net_wm_icon, AtomEnum::CARDINAL, 0, u32::MAX / 4)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .filter(|r| r.format == 32 && !r.value.is_empty())
+            .and_then(|r| r.value32().map(|it| it.collect::<Vec<u32>>()))
+            .and_then(|data| xh::parse_net_wm_icon(&data, icon_size));
+        if from_prop.is_some() {
+            return from_prop;
+        }
+        // Fall back to the icon theme keyed on WM_CLASS.
+        self.conn
+            .get_property(false, id, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| xh::parse_wm_class(&r.value))
+            .and_then(|cls| load_icon_file(&cls, icon_size))
     }
 
     /// Show the popup, starting at the second window (index 1, or 0 if only one).
@@ -182,11 +270,15 @@ impl<'a> Switcher<'a> {
         if self.popup.is_some() {
             return Ok(());
         }
+        let t0 = if self.debug { Some(std::time::Instant::now()) } else { None };
         // Reload config on every popup open so edits take effect without restarting.
         if let Ok(fresh) = Config::load() {
             self.config = fresh;
         }
         self.load_windows(root)?;
+        if let Some(t) = t0 {
+            eprintln!("[hop] load_windows(): {} windows in {:?}", self.windows.len(), t.elapsed());
+        }
         if self.windows.is_empty() {
             return Ok(());
         }
@@ -210,14 +302,18 @@ impl<'a> Switcher<'a> {
 
         self.create_popup()?;
         if self.debug { eprintln!("[hop] show(): {} windows, selected={}", self.windows.len(), self.selected); }
-        // Draw immediately with whatever is already cached (icons for uncached windows).
-        // Thumbnails are loaded progressively by pump_one_thumb() in the event loop.
+        // Paint immediately with just backgrounds, borders, and labels. Icons and
+        // thumbnails are not loaded yet — they stream in via pump_one_enrich().
         self.redraw()?;
 
-        if self.config.tile.content == "thumbnail" {
-            // Queue frames for progressive thumbnail loading. Already-cached entries
-            // (from MapNotify) will be refreshed; uncached ones loaded for the first time.
-            self.thumb_queue = self.windows.iter().map(|e| e.frame).collect();
+        // Queue every window for enrichment. The selected window goes first so its
+        // icon/thumbnail appears soonest, then the rest in order.
+        self.enrich_queue = (0..self.windows.len()).collect();
+        if self.selected != 0 {
+            if let Some(pos) = self.enrich_queue.iter().position(|&i| i == self.selected) {
+                let sel = self.enrich_queue.remove(pos).unwrap();
+                self.enrich_queue.push_front(sel);
+            }
         }
 
         Ok(())
@@ -408,8 +504,12 @@ impl<'a> Switcher<'a> {
         let tw = self.tile_w();
         let th = self.tile_h();
 
-        // Query render formats (needed on first draw; cheap thereafter).
-        let formats = self.conn.render_query_pict_formats()?.reply()?;
+        // Query render formats once and cache the (large) reply; it never changes
+        // for the connection, so subsequent redraws skip the round-trip.
+        if self.cached_formats.is_none() {
+            self.cached_formats = Some(std::rc::Rc::new(self.conn.render_query_pict_formats()?.reply()?));
+        }
+        let formats = self.cached_formats.clone().unwrap();
         let argb_fmt = formats.formats.iter()
             .find(|f| f.depth == 32 && f.type_ == PictType::DIRECT
                 && f.direct.alpha_mask == 0xFF
@@ -496,14 +596,14 @@ impl<'a> Switcher<'a> {
                 PictOp::SRC, pix_pic,
                 RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba },
                 &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
-            )?.check()?;
+            )?;
         } else {
             // Clear to transparent, then composite gradient on top.
             self.conn.render_fill_rectangles(
                 PictOp::SRC, pix_pic,
                 RenderColor { red: 0, green: 0, blue: 0, alpha: 0 },
                 &[Rectangle { x: 0, y: 0, width: pw, height: ph }],
-            )?.check()?;
+            )?;
             self.draw_bg_gradient(pix_pic, pw, ph, window_bg_argb, gradient_mode)?;
         }
 
@@ -544,7 +644,7 @@ impl<'a> Switcher<'a> {
                     PictOp::OVER, pix_pic,
                     RenderColor { red: ar, green: ag, blue: ab, alpha: aa },
                     &[Rectangle { x: tile_x, y: tile_y, width: tw as u16, height: th as u16 }],
-                )?.check()?;
+                )?;
 
                 // Frame (selected = frame color, others = inactive)
                 let (fr, fg_c, fb, fa) = argb_to_render_color(border_argb);
@@ -556,12 +656,12 @@ impl<'a> Switcher<'a> {
                         Rectangle { x: tile_x - fw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
                         Rectangle { x: tile_x + tw as i16, y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
                     ],
-                )?.check()?;
+                )?;
             }
 
             // Icon or thumbnail
             if self.config.tile.content == "thumbnail" {
-                self.draw_thumb(ctx, tile, entry, fg_argb, &formats)?;
+                self.draw_thumb(ctx, tile, entry, fg_argb)?;
                 if self.config.tile.icon_overlay && a8_fmt != 0 {
                     self.draw_icon_overlay(ctx, tile, entry)?;
                 }
@@ -594,7 +694,7 @@ impl<'a> Switcher<'a> {
                     Rectangle { x: sel_x - fw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
                     Rectangle { x: sel_x + tw as i16,  y: sel_y - fw as i16,  width: fw, height: th as u16 + 2 * fw },
                 ],
-            )?.check()?;
+            )?;
         }
 
         // Flush x11rb so all XRender work is committed to the pixmap before
@@ -632,7 +732,7 @@ impl<'a> Switcher<'a> {
         if self.debug { eprintln!("[hop] blit_to_window() win_br={win_br}"); }
 
         let win_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?.check()?;
+        self.conn.render_create_picture(win_pic, win, fmt, &CreatePictureAux::new())?;
 
         // Use the cached mask (built once in redraw()) for a single atomic SRC blit.
         // PictOp::SRC with mask: result = src * mask_alpha — corners (mask=0) become
@@ -646,9 +746,9 @@ impl<'a> Switcher<'a> {
             0, 0,   // mask x, y
             0, 0,   // dst x, y
             pw, ph,
-        )?.check()?;
+        )?;
 
-        self.conn.render_free_picture(win_pic)?.check()?;
+        self.conn.render_free_picture(win_pic)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -707,7 +807,7 @@ impl<'a> Switcher<'a> {
                 Rectangle { x: tile_x + tw as i16,  y: tile_y - fw as i16, width: fw, height: th as u16 + 2 * fw },
             ];
             // Erase the border strip area back to the flat window background.
-            self.conn.render_fill_rectangles(PictOp::SRC, pix_pic, win_bg, &border_rects)?.check()?;
+            self.conn.render_fill_rectangles(PictOp::SRC, pix_pic, win_bg, &border_rects)?;
 
             if use_rings {
                 // Composite the rounded ring shape on top (same formula as redraw()).
@@ -730,7 +830,7 @@ impl<'a> Switcher<'a> {
                         Rectangle { x: tile_x+tw16-cr16, y: tile_y,           width: cr, height: cr },
                         Rectangle { x: tile_x,           y: tile_y+th16-cr16, width: cr, height: cr },
                         Rectangle { x: tile_x+tw16-cr16, y: tile_y+th16-cr16, width: cr, height: cr },
-                    ])?.check()?;
+                    ])?;
                 }
 
                 draw_border_ring(
@@ -745,7 +845,7 @@ impl<'a> Switcher<'a> {
                 let (cr, cg, cb, ca) = argb_to_render_color(border_argb);
                 self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
                     RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
-                    &border_rects)?.check()?;
+                    &border_rects)?;
             }
         }
 
@@ -781,7 +881,7 @@ impl<'a> Switcher<'a> {
                         x: icon_x, y: icon_y,
                         width: icon_size as u16, height: icon_size as u16,
                     }],
-                )?.check()?;
+                )?;
                 return Ok(());
             }
         };
@@ -789,10 +889,10 @@ impl<'a> Switcher<'a> {
 
         // Upload pixels into a 32-bit pixmap
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
 
         let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
 
         // Vec<u32> ARGB pixels → native-endian bytes (matches XRender ARGB32 layout)
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
@@ -804,13 +904,13 @@ impl<'a> Switcher<'a> {
             0u8,         // left_pad
             32u8,        // depth
             &bytes,
-        )?.check()?;
-        self.conn.free_gc(gc)?.check()?;
+        )?;
+        self.conn.free_gc(gc)?;
 
         // Create an XRender Picture for the pixmap
         let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
-        self.conn.free_pixmap(pixmap)?.check()?;
+        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
+        self.conn.free_pixmap(pixmap)?;
 
         // Scale to icon_size if the source dimensions differ
         if src_w != icon_size || src_h != icon_size {
@@ -820,8 +920,8 @@ impl<'a> Switcher<'a> {
                 matrix11: sx, matrix12: 0, matrix13: 0,
                 matrix21: 0, matrix22: sy, matrix23: 0,
                 matrix31: 0, matrix32: 0, matrix33: 65536,
-            })?.check()?;
-            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?.check()?;
+            })?;
+            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?;
         }
 
         // Composite icon OVER the tile
@@ -834,9 +934,9 @@ impl<'a> Switcher<'a> {
             0, 0,        // mask_x, mask_y
             icon_x, icon_y,
             icon_size as u16, icon_size as u16,
-        )?.check()?;
+        )?;
 
-        self.conn.render_free_picture(icon_pic)?.check()?;
+        self.conn.render_free_picture(icon_pic)?;
         Ok(())
     }
 
@@ -869,17 +969,17 @@ impl<'a> Switcher<'a> {
 
         // Upload icon pixels into a temporary pixmap.
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
         let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
         self.conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc,
-            src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes)?.check()?;
-        self.conn.free_gc(gc)?.check()?;
+            src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes)?;
+        self.conn.free_gc(gc)?;
 
         let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
-        self.conn.free_pixmap(pixmap)?.check()?;
+        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
+        self.conn.free_pixmap(pixmap)?;
 
         // Scale to ov_size if needed.
         if src_w != ov_size || src_h != ov_size {
@@ -889,24 +989,24 @@ impl<'a> Switcher<'a> {
                 matrix11: sx, matrix12: 0, matrix13: 0,
                 matrix21: 0, matrix22: sy, matrix23: 0,
                 matrix31: 0, matrix32: 0, matrix33: 65536,
-            })?.check()?;
-            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?.check()?;
+            })?;
+            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?;
         }
 
         // Build a 1×1 A8 alpha-mask picture with repeat, giving 80% opacity.
         let alpha_pix = self.conn.generate_id()?;
-        self.conn.create_pixmap(8, alpha_pix, ctx.drawable, 1, 1)?.check()?;
+        self.conn.create_pixmap(8, alpha_pix, ctx.drawable, 1, 1)?;
         let alpha_pic = self.conn.generate_id()?;
         self.conn.render_create_picture(
             alpha_pic, alpha_pix, ctx.a8_fmt,
             &CreatePictureAux::new().repeat(Repeat::NORMAL),
-        )?.check()?;
-        self.conn.free_pixmap(alpha_pix)?.check()?;
+        )?;
+        self.conn.free_pixmap(alpha_pix)?;
         // 80% opacity: 204/255 * 65535 ≈ 52428 in 16-bit XRender alpha space.
         self.conn.render_fill_rectangles(PictOp::SRC, alpha_pic,
             RenderColor { red: 0, green: 0, blue: 0, alpha: 52428 },
             &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
-        )?.check()?;
+        )?;
 
         // Composite icon over the thumbnail with the alpha mask.
         self.conn.render_composite(
@@ -915,23 +1015,26 @@ impl<'a> Switcher<'a> {
             0, 0, 0, 0,
             ov_x, ov_y,
             ov_size as u16, ov_size as u16,
-        )?.check()?;
+        )?;
 
-        self.conn.render_free_picture(alpha_pic)?.check()?;
-        self.conn.render_free_picture(icon_pic)?.check()?;
+        self.conn.render_free_picture(alpha_pic)?;
+        self.conn.render_free_picture(icon_pic)?;
         Ok(())
     }
 
-    /// Render a scaled screenshot of the window (from the compositor's backing pixmap)
-    /// into the tile content area. Falls back to `draw_icon` when the compositor is not
-    /// running, the window is not redirected, or any X11 call fails.
+    /// Draw a window's thumbnail from the pixel cache into the tile content area.
+    ///
+    /// This reads ONLY the cache (downscaled ARGB pixels captured by cache_thumb).
+    /// The live capture — composite_name_window_pixmap + GetImage of the full-size
+    /// backing pixmap — is expensive and runs off the critical path in the enrich
+    /// pump, not here. Until a window's thumbnail has been captured, its icon is
+    /// drawn as a placeholder (and replaced once the thumbnail streams in).
     fn draw_thumb(
         &self,
         ctx: PictCtx,
         tile: TileGeom,
         entry: &WindowEntry,
         fg_argb: u32,
-        formats: &x11rb::protocol::render::QueryPictFormatsReply,
     ) -> Result<(), Box<dyn Error>> {
         let pad = self.tile_pad();
         let avail_w = tile.w.saturating_sub(2 * pad);
@@ -941,108 +1044,14 @@ impl<'a> Switcher<'a> {
             return self.draw_icon(ctx, tile, entry, fg_argb);
         }
 
-        // Use the pre-computed WM frame window (direct child of root).
-        // Compositors redirect only direct children of root, so NameWindowPixmap
-        // must be called on the frame rather than the client window.
-        let frame_win = entry.frame;
-
-        // Get the frame window's visual for XRender format lookup.
-        let visual_id = match self.conn.get_window_attributes(frame_win)
-            .ok().and_then(|c| c.reply().ok()).map(|a| a.visual)
-        {
-            Some(v) => v,
-            None => {
-                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                        tile.x, tile.y, avail_w, avail_h, pad);
-                }
-                return self.draw_icon(ctx, tile, entry, fg_argb);
-            }
-        };
-
-        // Grab the compositor's off-screen backing pixmap for the frame window.
-        let thumb_pix = self.conn.generate_id()?;
-        let name_ok = self.conn
-            .composite_name_window_pixmap(frame_win, thumb_pix)
-            .ok().and_then(|c| c.check().ok()).is_some();
-        if !name_ok {
-            // Window is likely on another desktop (unmapped). Try the pixel cache.
-            if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                    tile.x, tile.y, avail_w, avail_h, pad);
-            }
-            return self.draw_icon(ctx, tile, entry, fg_argb);
+        if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&entry.frame) {
+            return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                tile.x, tile.y, avail_w, avail_h, pad);
         }
 
-        // Query actual window dimensions via the pixmap geometry.
-        let geom = match self.conn.get_geometry(thumb_pix).ok().and_then(|c| c.reply().ok()) {
-            Some(g) => g,
-            None => {
-                let _ = self.conn.free_pixmap(thumb_pix).ok();
-                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                        tile.x, tile.y, avail_w, avail_h, pad);
-                }
-                return self.draw_icon(ctx, tile, entry, fg_argb);
-            }
-        };
-        let src_w = geom.width as u32;
-        let src_h = geom.height as u32;
-        if src_w == 0 || src_h == 0 {
-            let _ = self.conn.free_pixmap(thumb_pix).ok();
-            return self.draw_icon(ctx, tile, entry, fg_argb);
-        }
-
-        // Find the XRender PictFormat that matches this window's visual.
-        let win_fmt_id = match find_format_for_visual(formats, visual_id, self.screen_num) {
-            Some(id) => id,
-            None => {
-                let _ = self.conn.free_pixmap(thumb_pix).ok();
-                if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&frame_win) {
-                    return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                        tile.x, tile.y, avail_w, avail_h, pad);
-                }
-                return self.draw_icon(ctx, tile, entry, fg_argb);
-            }
-        };
-
-        // Create an XRender Picture for the pixmap; the picture holds a server-side
-        // reference so we can free the pixmap name immediately.
-        let thumb_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(thumb_pic, thumb_pix, win_fmt_id, &CreatePictureAux::new())?.check()?;
-        self.conn.free_pixmap(thumb_pix)?.check()?;
-
-        // Scale the window to fit inside (avail_w × avail_h), preserving aspect ratio.
-        let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
-        let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
-        let dst_h = ((src_h as f64 / scale).round() as u32).max(1).min(avail_h);
-
-        // Center the thumbnail within the available content area.
-        let dst_x = tile.x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
-        let dst_y = tile.y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
-
-        // Set a bilinear scaling transform (16.16 fixed-point).
-        let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
-        let sy = ((src_h as f64 / dst_h as f64) * 65536.0).round() as i32;
-        self.conn.render_set_picture_transform(thumb_pic, Transform {
-            matrix11: sx, matrix12: 0, matrix13: 0,
-            matrix21: 0, matrix22: sy, matrix23: 0,
-            matrix31: 0, matrix32: 0, matrix33: 65536,
-        })?.check()?;
-        self.conn.render_set_picture_filter(thumb_pic, b"bilinear", &[])?.check()?;
-
-        // Composite the thumbnail onto the off-screen buffer.
-        self.conn.render_composite(
-            PictOp::OVER,
-            thumb_pic, 0u32, ctx.pic,
-            0, 0,   // src_x, src_y
-            0, 0,   // mask_x, mask_y
-            dst_x, dst_y,
-            dst_w as u16, dst_h as u16,
-        )?.check()?;
-
-        self.conn.render_free_picture(thumb_pic)?.check()?;
-        Ok(())
+        // Not captured yet — show the icon as a placeholder until the enrich pump
+        // caches the thumbnail and triggers a redraw.
+        self.draw_icon(ctx, tile, entry, fg_argb)
     }
 
     /// Render the window title at the bottom of a tile.
@@ -1297,7 +1306,7 @@ impl<'a> Switcher<'a> {
             self.conn.flush()?;
         }
         self.windows.clear();
-        self.thumb_queue.clear();
+        self.enrich_queue.clear();
         Ok(())
     }
 
@@ -1377,7 +1386,7 @@ impl<'a> Switcher<'a> {
                     outer_r, // outer radius
                     stops,
                     &[color_bg, color_trans], // center = bg, edge = transparent
-                )?.check()?;
+                )?;
             }
             "horizontal" => {
                 // Left = transparent, right = background color.
@@ -1385,7 +1394,7 @@ impl<'a> Switcher<'a> {
                 let p2 = Pointfix { x: pw as i32 * 65536, y: 0 };
                 self.conn.render_create_linear_gradient(
                     grad_pic, p1, p2, stops, &[color_trans, color_bg],
-                )?.check()?;
+                )?;
             }
             _ => {
                 // "vertical" (default): transparent top → opaque bottom.
@@ -1393,7 +1402,7 @@ impl<'a> Switcher<'a> {
                 let p2 = Pointfix { x: 0, y: ph as i32 * 65536 };
                 self.conn.render_create_linear_gradient(
                     grad_pic, p1, p2, stops, &[color_trans, color_bg],
-                )?.check()?;
+                )?;
             }
         }
 
@@ -1404,31 +1413,43 @@ impl<'a> Switcher<'a> {
             0, 0,  // mask x, y
             0, 0,  // dst x, y
             pw, ph,
-        )?.check()?;
+        )?;
 
-        self.conn.render_free_picture(grad_pic)?.check()?;
+        self.conn.render_free_picture(grad_pic)?;
         Ok(())
     }
 
-    /// Capture and cache a thumbnail for `frame_win` (a direct child of root).
-    /// Downloads the compositor's backing pixmap pixels via GetImage and stores them
-    /// as ARGB u32 values. Called on MapNotify and at popup-open time so thumbnails
-    /// True while there are frames still waiting for their thumbnail to be fetched.
-    /// Used by the event loop to decide between blocking and non-blocking event polling.
-    pub fn has_pending_thumbs(&self) -> bool {
-        !self.thumb_queue.is_empty()
+    /// True while windows are still waiting to be enriched (icon + thumbnail).
+    /// The event loop uses this to decide between blocking and non-blocking polling.
+    pub fn has_pending_enrich(&self) -> bool {
+        !self.enrich_queue.is_empty()
     }
 
-    /// Fetch one thumbnail from the front of the queue and update the display.
-    /// Called from the event loop (after polling for events) so that the popup
-    /// appears immediately and thumbnails fill in one per iteration.
-    pub fn pump_one_thumb(&mut self) -> Result<(), Box<dyn Error>> {
-        let frame = match self.thumb_queue.pop_front() {
-            Some(f) => f,
+    /// Enrich one window from the front of the queue: fetch its icon (if not yet
+    /// loaded) and capture its thumbnail (in thumbnail mode), then redraw so the
+    /// new content appears. Called from the event loop after polling for events,
+    /// so the popup paints immediately and fills in one window per iteration.
+    pub fn pump_one_enrich(&mut self) -> Result<(), Box<dyn Error>> {
+        let idx = match self.enrich_queue.pop_front() {
+            Some(i) => i,
             None => return Ok(()),
         };
+        if idx >= self.windows.len() {
+            return Ok(());
+        }
+
+        // Load the icon if we don't have one yet.
+        if self.windows[idx].icon.is_none() {
+            let id = self.windows[idx].id;
+            let icon = self.fetch_icon(id);
+            self.windows[idx].icon = icon;
+        }
+
+        // Capture the thumbnail (no-op outside thumbnail mode).
+        let frame = self.windows[idx].frame;
         self.cache_thumb(frame);
-        // Redraw now so each thumbnail appears as soon as it's ready.
+
+        // Redraw so the freshly loaded icon/thumbnail appears.
         self.redraw()
     }
 
@@ -1544,19 +1565,19 @@ impl<'a> Switcher<'a> {
         if src_w == 0 || src_h == 0 { return Ok(()); }
 
         let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?.check()?;
+        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
         let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?.check()?;
+        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
         self.conn.put_image(
             ImageFormat::Z_PIXMAP, pixmap, gc,
             src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes,
-        )?.check()?;
-        self.conn.free_gc(gc)?.check()?;
+        )?;
+        self.conn.free_gc(gc)?;
 
         let pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?.check()?;
-        self.conn.free_pixmap(pixmap)?.check()?;
+        self.conn.render_create_picture(pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
+        self.conn.free_pixmap(pixmap)?;
 
         let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
         let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
@@ -1570,14 +1591,14 @@ impl<'a> Switcher<'a> {
             matrix11: sx, matrix12: 0, matrix13: 0,
             matrix21: 0, matrix22: sy, matrix23: 0,
             matrix31: 0, matrix32: 0, matrix33: 65536,
-        })?.check()?;
-        self.conn.render_set_picture_filter(pic, b"bilinear", &[])?.check()?;
+        })?;
+        self.conn.render_set_picture_filter(pic, b"bilinear", &[])?;
 
         self.conn.render_composite(
             PictOp::OVER, pic, 0u32, ctx.pic,
             0, 0, 0, 0, dst_x, dst_y, dst_w as u16, dst_h as u16,
-        )?.check()?;
-        self.conn.render_free_picture(pic)?.check()?;
+        )?;
+        self.conn.render_free_picture(pic)?;
         Ok(())
     }
 

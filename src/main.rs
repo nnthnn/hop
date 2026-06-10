@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // While thumbnails are loading, poll non-blocking so we can interleave
         // input handling with one GetImage download per iteration. When idle,
         // block until the next event to avoid busy-waiting.
-        let maybe_event = if switcher.has_pending_thumbs() {
+        let maybe_event = if switcher.has_pending_enrich() {
             display.conn.poll_for_event()?
         } else {
             Some(display.conn.wait_for_event()?)
@@ -141,10 +141,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             _ => {}
         } } // end match event / if let Some(event)
 
-        // Progressive thumbnail loading: fetch one frame per loop iteration.
-        // Runs only while the popup is visible and the queue is non-empty.
-        if switcher.has_pending_thumbs() {
-            switcher.pump_one_thumb()?;
+        // Progressive enrichment: load one window's icon + thumbnail per loop
+        // iteration. Runs only while the popup is visible and the queue is non-empty.
+        if switcher.has_pending_enrich() {
+            switcher.pump_one_enrich()?;
         }
     }
 }
