@@ -661,8 +661,11 @@ impl<'a> Switcher<'a> {
 
             // Icon or thumbnail
             if self.config.tile.content == "thumbnail" {
-                self.draw_thumb(ctx, tile, entry, fg_argb)?;
-                if self.config.tile.icon_overlay && a8_fmt != 0 {
+                let drew_thumb = self.draw_thumb(ctx, tile, entry, fg_argb)?;
+                // Only overlay the small corner icon on real thumbnails — on icon
+                // fallbacks the big icon already identifies the window, so the
+                // overlay would just be the same icon drawn twice.
+                if drew_thumb && self.config.tile.icon_overlay && a8_fmt != 0 {
                     self.draw_icon_overlay(ctx, tile, entry)?;
                 }
             } else {
@@ -1029,29 +1032,35 @@ impl<'a> Switcher<'a> {
     /// backing pixmap — is expensive and runs off the critical path in the enrich
     /// pump, not here. Until a window's thumbnail has been captured, its icon is
     /// drawn as a placeholder (and replaced once the thumbnail streams in).
+    ///
+    /// Returns `true` if a thumbnail was drawn, `false` if it fell back to the icon
+    /// (so the caller can skip the redundant corner icon-overlay on icon-only tiles).
     fn draw_thumb(
         &self,
         ctx: PictCtx,
         tile: TileGeom,
         entry: &WindowEntry,
         fg_argb: u32,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<bool, Box<dyn Error>> {
         let pad = self.tile_pad();
         let avail_w = tile.w.saturating_sub(2 * pad);
         let avail_h = tile.h.saturating_sub(LABEL_H + 2 * pad);
 
         if avail_w == 0 || avail_h == 0 {
-            return self.draw_icon(ctx, tile, entry, fg_argb);
+            self.draw_icon(ctx, tile, entry, fg_argb)?;
+            return Ok(false);
         }
 
         if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&entry.frame) {
-            return self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                tile.x, tile.y, avail_w, avail_h, pad);
+            self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
+                tile.x, tile.y, avail_w, avail_h, pad)?;
+            return Ok(true);
         }
 
         // Not captured yet — show the icon as a placeholder until the enrich pump
         // caches the thumbnail and triggers a redraw.
-        self.draw_icon(ctx, tile, entry, fg_argb)
+        self.draw_icon(ctx, tile, entry, fg_argb)?;
+        Ok(false)
     }
 
     /// Render the window title at the bottom of a tile.
