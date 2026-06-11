@@ -1,0 +1,60 @@
+# Maintainer: Nathan Greenhaw <me@nathang.me>
+
+# Builds hop from the latest git commit. Once tagged releases exist, a stable
+# `hop` package using a release tarball is preferable (see notes at the bottom).
+#
+# Before publishing to the AUR, replace USERNAME below with the real GitHub
+# (or other) account, then regenerate .SRCINFO:
+#     makepkg --printsrcinfo > .SRCINFO
+
+pkgname=hop-git
+_pkgname=hop
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="A configurable X11 Alt+Tab window switcher with ARGB transparency"
+arch=('x86_64')
+url="https://github.com/USERNAME/hop"
+license=('MIT')
+depends=('libx11' 'libxft')
+makedepends=('cargo' 'git')
+optdepends=('picom: compositor for transparency, blur, and live thumbnails')
+provides=('hop')
+conflicts=('hop')
+source=("$_pkgname::git+https://github.com/USERNAME/hop.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$_pkgname"
+	# e.g. r123.abc1234 — commit count plus short hash, monotonic for the AUR.
+	printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+	cd "$_pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	# Vendor dependencies up front so build() can run fully offline (--frozen).
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$_pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+package() {
+	cd "$_pkgname"
+	install -Dm755 "target/release/hop" "$pkgdir/usr/bin/hop"
+	install -Dm644 "config.example.toml" "$pkgdir/usr/share/hop/config.example.toml"
+	install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+# ── Cutting a stable `hop` package later ───────────────────────────────────────
+# When you tag releases (e.g. v0.1.0), prefer a versioned package:
+#   pkgname=hop
+#   pkgver=0.1.0
+#   source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+#   sha256sums=('<run: makepkg -g>')
+# Drop the pkgver()/git bits, and cd into "$pkgname-$pkgver" in each function.
