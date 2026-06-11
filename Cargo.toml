@@ -3,6 +3,11 @@ name = "hop"
 version = "0.1.0"
 edition = "2021"
 description = "A configurable X11 Alt+Tab window switcher with ARGB transparency"
+authors = ["Nathan Greenhaw <me@nathang.me>"]
+license = "MIT"
+readme = "README.md"
+keywords = ["x11", "alt-tab", "window-switcher", "switcher", "ewmh"]
+categories = ["command-line-utilities", "gui"]
 
 [dependencies]
 x11rb = { version = "0.13", features = ["all-extensions"] }
