@@ -47,6 +47,12 @@ pub struct WindowConfig {
     /// For dual_kawase the useful range is 1–20; higher = more blur.
     #[serde(default = "default_blur_strength")]
     pub blur_strength: u32,
+    /// Whether hop may edit the user's picom config to match its blur/shadow/corner
+    /// settings (and reload picom). Opt-in: defaults to false so hop never touches
+    /// picom.conf unless explicitly enabled. When false, you manage your own picom
+    /// exclude lists and blur-background setting.
+    #[serde(default)]
+    pub configure_picom: bool,
     /// Extra pixels of space between adjacent tiles (beyond the tile border).
     #[serde(default)]
     pub gap: u32,
@@ -207,6 +213,7 @@ impl Default for WindowConfig {
             blur:                true,
             blur_method:         default_blur_method(),
             blur_strength:       default_blur_strength(),
+            configure_picom:     false,
             gap:                 0,
             padding:             0,
             last_row_position:   default_last_row_position(),

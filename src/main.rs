@@ -151,6 +151,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// Sync picom's config with hop's settings for blur, shadow, and rounded corners.
 fn maybe_configure_picom(config: &Config) {
+    // Opt-out: when configure_picom = false, never touch the user's picom.conf.
+    if !config.window.configure_picom {
+        return;
+    }
+
     let want_blur    = config.window.blur || config.tile.blur;
     let want_shadow  = config.window.shadow;
     let want_corners = config.window.corners;

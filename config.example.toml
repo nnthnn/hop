@@ -31,6 +31,11 @@ blur               = false
 blur_method        = "dual_kawase"
 # picom blur strength. For dual_kawase: 1–20, higher = more blur.
 blur_strength      = 5
+# Opt-in: allow hop to edit your picom config (and reload picom) to match the
+# blur, shadow, and corner settings here. Defaults to false so hop never touches
+# picom.conf on its own. Set to true only if you want hop to manage picom's
+# blur-background and exclude lists for you; otherwise configure picom yourself.
+configure_picom    = false
 # Show picom drop shadow on the popup. When false, hop adds itself to shadow-exclude.
 shadow             = false
 # Show picom rounded corners on the popup. When false, hop adds itself to
