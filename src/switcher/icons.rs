@@ -1,4 +1,4 @@
-/// Icon loading: XDG hicolor theme search and PNG decoding.
+//! Icon loading: XDG hicolor theme search and PNG decoding.
 
 /// Search standard XDG icon theme paths for a PNG icon matching `class`.
 /// Tries both the lowercase and original-case class name, and prefers the size

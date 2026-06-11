@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::error::Error;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub window: WindowConfig,
@@ -192,16 +192,6 @@ fn default_next_key() -> String { "Tab".into() }
 fn default_prev_key() -> String { "Shift+Tab".into() }
 fn default_cancel_key() -> String { "Escape".into() }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            window: WindowConfig::default(),
-            tile:   TileConfig::default(),
-            font:   FontConfig::default(),
-            keys:   KeysConfig::default(),
-        }
-    }
-}
 impl Default for WindowConfig {
     fn default() -> Self {
         WindowConfig {

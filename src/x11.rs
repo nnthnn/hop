@@ -1,4 +1,4 @@
-/// X11 helpers: connection setup, EWMH, key codes, ARGB visual lookup.
+//! X11 helpers: connection setup, EWMH, key codes, ARGB visual lookup.
 
 use std::error::Error;
 use x11rb::connection::Connection;
@@ -349,7 +349,7 @@ pub fn parse_net_wm_icon(data: &[u32], target_size: u32) -> Option<(u32, u32, Ve
         if i + (w * h) as usize > data.len() {
             break;
         }
-        let is_better = best.map_or(true, |(bw, _, _)| {
+        let is_better = best.is_none_or(|(bw, _, _)| {
             let cur_diff = (w as i64 - target_size as i64).unsigned_abs();
             let best_diff = (bw as i64 - target_size as i64).unsigned_abs();
             cur_diff < best_diff || (cur_diff == best_diff && w > bw)

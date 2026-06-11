@@ -1,4 +1,9 @@
-/// XRender drawing utilities: pixel scaling, rounded rects, border rings, color conversion.
+//! XRender drawing utilities: pixel scaling, rounded rects, border rings, color conversion.
+
+// These low-level drawing primitives take many positional geometry/color args by
+// nature. Folding them into a TileGeom/Rect-style struct is tracked in TODO.md;
+// until then, allow the wide signatures module-wide.
+#![allow(clippy::too_many_arguments)]
 
 use std::error::Error;
 use x11rb::connection::Connection;
@@ -37,10 +42,10 @@ pub(super) fn downscale_argb(pixels: &[u32], src_w: u32, src_h: u32, dst_w: u32,
                     n += 1;
                 }
             }
-            if n > 0 {
-                out[(dy * dst_w + dx) as usize] =
-                    (((a/n) as u32) << 24) | (((r/n) as u32) << 16) | (((g/n) as u32) << 8) | (b/n) as u32;
-            }
+            // Empty source region — leave the output pixel at its initialized 0.
+            if n == 0 { continue; }
+            out[(dy * dst_w + dx) as usize] =
+                (((a/n) as u32) << 24) | (((r/n) as u32) << 16) | (((g/n) as u32) << 8) | (b/n) as u32;
         }
     }
     out

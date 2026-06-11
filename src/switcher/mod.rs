@@ -1,4 +1,4 @@
-/// The switcher popup window: layout, rendering, state machine.
+//! The switcher popup window: layout, rendering, state machine.
 
 mod icons;
 mod text_util;
@@ -542,10 +542,8 @@ impl<'a> Switcher<'a> {
         self.cached_a8_fmt = a8_fmt;
 
         // Reuse the persistent pixmap when dimensions match; recreate otherwise.
-        let pix_buf_fresh = match self.pix_buf {
-            Some((_, _, cpw, cph)) if cpw == pw && cph == ph => false,
-            _ => true,
-        };
+        let pix_buf_fresh = !matches!(self.pix_buf,
+            Some((_, _, cpw, cph)) if cpw == pw && cph == ph);
         let (pixmap, pix_pic) = match self.pix_buf {
             Some((pix, pic, cpw, cph)) if cpw == pw && cph == ph => (pix, pic),
             _ => {
@@ -1559,6 +1557,9 @@ impl<'a> Switcher<'a> {
     /// Upload ARGB pixel data into a temporary pixmap, scale it to fit within
     /// `(avail_w × avail_h)` preserving aspect ratio, and composite OVER `pix_pic`.
     /// Used to render cached thumbnails for off-desktop windows.
+    // Wide positional signature (geometry + pixels); folding into a Rect struct is
+    // tracked in TODO.md alongside the other drawing helpers.
+    #[allow(clippy::too_many_arguments)]
     fn draw_pixels_scaled(
         &self,
         ctx: PictCtx,

@@ -1,4 +1,4 @@
-/// Text utilities: font loading, word-wrap, title truncation, shadow color.
+//! Text utilities: font loading, word-wrap, title truncation, shadow color.
 
 use std::error::Error;
 use x11rb::connection::Connection;
