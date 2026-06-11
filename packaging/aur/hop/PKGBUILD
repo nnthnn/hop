@@ -19,7 +19,7 @@ depends=('libx11' 'libxft')
 makedepends=('cargo')
 optdepends=('picom: compositor for transparency, blur, and live thumbnails')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('3aa3a1a91e97d0caf66bab1e109dc89ce4e4f2d0b84135c71e1920eac2684191')
+sha256sums=('6107b901843f7f1ed36d0fdf0442d8e3d6332c721d1dcb64675bce5913049093')
 
 prepare() {
 	cd "$pkgname-$pkgver"
