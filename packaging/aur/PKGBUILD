@@ -3,8 +3,7 @@
 # Builds hop from the latest git commit. Once tagged releases exist, a stable
 # `hop` package using a release tarball is preferable (see notes at the bottom).
 #
-# Before publishing to the AUR, replace USERNAME below with the real GitHub
-# (or other) account, then regenerate .SRCINFO:
+# Before publishing to the AUR, generate .SRCINFO from this PKGBUILD:
 #     makepkg --printsrcinfo > .SRCINFO
 
 pkgname=hop-git
@@ -13,14 +12,14 @@ pkgver=r1.0000000
 pkgrel=1
 pkgdesc="A configurable X11 Alt+Tab window switcher with ARGB transparency"
 arch=('x86_64')
-url="https://github.com/USERNAME/hop"
+url="https://github.com/nnthnn/hop"
 license=('MIT')
 depends=('libx11' 'libxft')
 makedepends=('cargo' 'git')
 optdepends=('picom: compositor for transparency, blur, and live thumbnails')
 provides=('hop')
 conflicts=('hop')
-source=("$_pkgname::git+https://github.com/USERNAME/hop.git")
+source=("$_pkgname::git+https://github.com/nnthnn/hop.git")
 sha256sums=('SKIP')
 
 pkgver() {

@@ -6,6 +6,7 @@ description = "A configurable X11 Alt+Tab window switcher with ARGB transparency
 authors = ["Nathan Greenhaw <me@nathang.me>"]
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/nnthnn/hop"
 keywords = ["x11", "alt-tab", "window-switcher", "switcher", "ewmh"]
 categories = ["command-line-utilities", "gui"]
 
