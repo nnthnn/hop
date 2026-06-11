@@ -1,0 +1,44 @@
+# Maintainer: Nathan Greenhaw <me@nathang.me>
+
+# Stable release package: builds hop from a tagged GitHub release tarball.
+# For the bleeding-edge variant that tracks git HEAD, see ../hop-git/PKGBUILD.
+#
+# To bump to a new release: update pkgver, refresh the checksum with
+#     makepkg -g
+# then regenerate .SRCINFO with
+#     makepkg --printsrcinfo > .SRCINFO
+
+pkgname=hop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A configurable X11 Alt+Tab window switcher with ARGB transparency"
+arch=('x86_64')
+url="https://github.com/nnthnn/hop"
+license=('MIT')
+depends=('libx11' 'libxft')
+makedepends=('cargo')
+optdepends=('picom: compositor for transparency, blur, and live thumbnails')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('3aa3a1a91e97d0caf66bab1e109dc89ce4e4f2d0b84135c71e1920eac2684191')
+
+prepare() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	# Vendor dependencies up front so build() can run fully offline (--frozen).
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+package() {
+	cd "$pkgname-$pkgver"
+	install -Dm755 "target/release/hop" "$pkgdir/usr/bin/hop"
+	install -Dm644 "config.example.toml" "$pkgdir/usr/share/hop/config.example.toml"
+	install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

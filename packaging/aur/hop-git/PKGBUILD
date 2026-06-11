@@ -50,10 +50,5 @@ package() {
 	install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 
-# ── Cutting a stable `hop` package later ───────────────────────────────────────
-# When you tag releases (e.g. v0.1.0), prefer a versioned package:
-#   pkgname=hop
-#   pkgver=0.1.0
-#   source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-#   sha256sums=('<run: makepkg -g>')
-# Drop the pkgver()/git bits, and cd into "$pkgname-$pkgver" in each function.
+# For the stable, versioned package built from a release tarball, see
+# ../hop/PKGBUILD.
