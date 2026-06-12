@@ -22,25 +22,11 @@ background         = "#282a36ff"
 # "horizontal" = transparent at left, background color at right
 # Combine with a semi-transparent background (e.g. "#282a3680") for best results.
 background_gradient = "none"
-# Apply compositor blur behind the entire popup window.
-# When blur = true, hop will also ensure picom has blur-background = true and
-# will configure blur-method / blur-strength below if they are not already set.
+# Request compositor blur behind the entire popup via the
+# _KDE_NET_WM_BLUR_BEHIND_REGION hint. hop only sets the hint — your compositor
+# (picom, KWin, …) must have blur enabled for it to show. hop does NOT edit your
+# compositor's config; see the README for a picom setup snippet.
 blur               = false
-# picom blur method (dual_kawase, gaussian, box, kernel). Only written to picom's
-# config if hop needs to enable blur-background itself.
-blur_method        = "dual_kawase"
-# picom blur strength. For dual_kawase: 1–20, higher = more blur.
-blur_strength      = 5
-# Opt-in: allow hop to edit your picom config (and reload picom) to match the
-# blur, shadow, and corner settings here. Defaults to false so hop never touches
-# picom.conf on its own. Set to true only if you want hop to manage picom's
-# blur-background and exclude lists for you; otherwise configure picom yourself.
-configure_picom    = false
-# Show picom drop shadow on the popup. When false, hop adds itself to shadow-exclude.
-shadow             = false
-# Show picom rounded corners on the popup. When false, hop adds itself to
-# rounded-corners-exclude.
-corners            = false
 
 [tile]
 width        = 200

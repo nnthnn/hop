@@ -10,8 +10,8 @@ transparency, live window thumbnails, and compositor blur support.
 - **App icons** from `_NET_WM_ICON`, with an XDG icon-theme fallback by `WM_CLASS`
 - **Window title labels** rendered with Xft (antialiased, Fontconfig fonts)
 - **ARGB 32-bit transparency** — semi-transparent tile and popup backgrounds
-- **Compositor blur** via `_KDE_NET_WM_BLUR_BEHIND_REGION` (whole popup or per-tile),
-  with opt-in automatic picom configuration
+- **Compositor blur** via the `_KDE_NET_WM_BLUR_BEHIND_REGION` hint (whole popup or
+  per-tile) — honored by picom, KWin, and other compositors
 - **Styling** — rounded corners, configurable borders, gradients, drop shadows
 - **Multi-monitor** — the popup centers on the monitor under the pointer
 - **Configurable keybindings** — modifier, next, prev, and cancel keys via TOML
@@ -105,9 +105,18 @@ Disable xfwm4's built-in Alt+Tab so it doesn't conflict:
 xfconf-query -c xfwm4 -p /general/cycle_windows_key -s ""
 ```
 
-## Compositor (picom)
+## Compositor setup
 
-For transparency and blur, run picom. To enable blur:
+hop draws with an ARGB visual and asks the compositor to blur behind the popup by
+setting the standard `_KDE_NET_WM_BLUR_BEHIND_REGION` hint (honored by picom, KWin,
+and others). hop **never edits your compositor's config** — it only sets the hint
+and its own `WM_CLASS = "hop"`, so you stay in control of your compositor and hop
+works with whatever you run. You enable blur (and any shadow/corner rules) yourself,
+once.
+
+### picom
+
+Run picom for transparency, blur, and live thumbnails. To enable blur globally:
 
 ```
 blur-background = true;
@@ -115,7 +124,18 @@ blur-method = "dual_kawase";
 blur-strength = 8;
 ```
 
-By default hop never modifies your picom config. If you'd rather have it manage
-these settings for you — enabling `blur-background` and keeping its exclude lists
-in sync with hop's blur/shadow/corner options — set `window.configure_picom =
-true` in the config, and hop will edit `picom.conf` and reload picom.
+hop's popup is matchable as `class_g = 'hop'`. Use that to tune picom's effects for
+the switcher — for example, to keep blur but drop the shadow and rounded corners on
+the popup:
+
+```
+shadow-exclude = [ "class_g = 'hop'" ];
+rounded-corners-exclude = [ "class_g = 'hop'" ];
+```
+
+### Other compositors
+
+Any compositor that honors `_KDE_NET_WM_BLUR_BEHIND_REGION` (e.g. KWin) will blur
+behind the popup with no extra setup. Compositors that don't support the hint still
+render hop's ARGB transparency; you just won't get blur. Live thumbnails require a
+compositor with the COMPOSITE extension.

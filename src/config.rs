@@ -36,23 +36,12 @@ pub struct WindowConfig {
     /// "horizontal" = transparent left → opaque right.
     #[serde(default = "default_background_gradient")]
     pub background_gradient: String,
-    /// Apply compositor blur behind the entire popup window.
+    /// Request compositor blur behind the entire popup window via the
+    /// `_KDE_NET_WM_BLUR_BEHIND_REGION` hint. The compositor (picom, KWin, …) must
+    /// have blur enabled for this to take effect — hop only sets the hint, it does
+    /// not configure your compositor. See the README for picom setup.
     #[serde(default = "default_true")]
     pub blur: bool,
-    /// picom blur-method to configure if hop enables blur in picom's config.
-    /// Supported values: dual_kawase, gaussian, box, kernel.
-    #[serde(default = "default_blur_method")]
-    pub blur_method: String,
-    /// picom blur-strength to configure if hop enables blur in picom's config.
-    /// For dual_kawase the useful range is 1–20; higher = more blur.
-    #[serde(default = "default_blur_strength")]
-    pub blur_strength: u32,
-    /// Whether hop may edit the user's picom config to match its blur/shadow/corner
-    /// settings (and reload picom). Opt-in: defaults to false so hop never touches
-    /// picom.conf unless explicitly enabled. When false, you manage your own picom
-    /// exclude lists and blur-background setting.
-    #[serde(default)]
-    pub configure_picom: bool,
     /// Extra pixels of space between adjacent tiles (beyond the tile border).
     #[serde(default)]
     pub gap: u32,
@@ -64,14 +53,6 @@ pub struct WindowConfig {
     /// Accepted values: "left", "center", "right". Default: "center".
     #[serde(default = "default_last_row_position")]
     pub last_row_position: String,
-    /// Show picom drop shadow on the popup. When false, hop adds itself to
-    /// picom's shadow-exclude list. Default: false (no shadow).
-    #[serde(default)]
-    pub shadow: bool,
-    /// Show picom rounded corners on the popup. When false, hop adds itself to
-    /// picom's rounded-corners-exclude list. Default: false (no rounded corners).
-    #[serde(default)]
-    pub corners: bool,
     /// Corner radius for the popup window background (px). 0 = square corners.
     /// Clips the XRender framebuffer to a rounded shape so compositor transparency
     /// shows through at the corners.
@@ -175,8 +156,6 @@ fn default_inactive() -> String { "#44475aff".into() }
 
 fn default_background_gradient() -> String { "none".into() }
 
-fn default_blur_method() -> String { "dual_kawase".into() }
-fn default_blur_strength() -> u32 { 5 }
 
 fn default_font_name() -> String { "sans".into() }
 fn default_font_size() -> u32 { 11 }
@@ -201,14 +180,9 @@ impl Default for WindowConfig {
             background:          default_window_bg(),
             background_gradient: default_background_gradient(),
             blur:                true,
-            blur_method:         default_blur_method(),
-            blur_strength:       default_blur_strength(),
-            configure_picom:     false,
             gap:                 0,
             padding:             0,
             last_row_position:   default_last_row_position(),
-            shadow:              false,
-            corners:             false,
             border_radius:       0,
         }
     }
@@ -341,8 +315,6 @@ impl Config {
             &["none", "radial", "vertical", "horizontal"], &mut errs);
         check_one("window.last_row_position", &self.window.last_row_position,
             &["left", "center", "right"], &mut errs);
-        check_one("window.blur_method", &self.window.blur_method,
-            &["dual_kawase", "gaussian", "box", "kernel"], &mut errs);
         check_one("tile.content", &self.tile.content,
             &["icon", "thumbnail"], &mut errs);
 
@@ -495,10 +467,10 @@ mod tests {
     fn validate_reports_multiple_problems_at_once() {
         let mut c = Config::default();
         c.tile.width = 0;
-        c.window.blur_method = "blurry".into();
+        c.window.background_gradient = "swirl".into();
         let err = c.validate().unwrap_err();
         assert!(err.contains("tile.width"));
-        assert!(err.contains("window.blur_method"));
+        assert!(err.contains("window.background_gradient"));
     }
 
     #[test]
