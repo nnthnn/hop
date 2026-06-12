@@ -17,6 +17,30 @@ unit-test suite covering the pure color/icon/text/validation logic.
 
 ## Features
 
+### In progress (recommended set)
+
+- [ ] **Type-to-filter** — typing while the popup is open narrows the list by window
+  title / `WM_CLASS` (case-insensitive substring), re-laying-out and resizing the popup
+  live. Backspace deletes. The whole keyboard is already grabbed while visible.
+- [ ] **Quick-select labels** — overlay a key hint (`1`–`9`, then `a`–`z`) on each tile;
+  pressing it activates that window directly. Pairs with type-to-filter.
+- [ ] **Close window from the switcher** — a key (e.g. `Delete`) or middle-click on the
+  selected tile sends `_NET_CLOSE_WINDOW`, then refreshes the list.
+
+### Backlog
+
+- [ ] **2D arrow-key navigation** — Up/Down/Left/Right move by grid row/column instead of
+  only linear next/prev.
+- [ ] **App exclude list** — `[filter] exclude_classes = ["..."]` to skip specific apps by
+  `WM_CLASS`, layered onto the existing window-type skip filter.
+- [ ] **Urgent-window highlight** — draw tiles with `_NET_WM_STATE_DEMANDS_ATTENTION` in a
+  distinct border color.
+- [ ] **Filter scope toggle** — current-desktop-only / current-monitor-only modes (config
+  default + a runtime toggle key).
+- [ ] **True MRU ordering** — maintain a most-recently-used stack from focus changes
+  instead of relying on `_NET_CLIENT_LIST_STACKING`.
+- [ ] **App grouping** — two-level switching (apps, then windows within an app).
+
 - [ ] **Release packaging**
   Makefile with `install` target (copies binary to `~/.local/bin/hop`, config example to
   `~/.config/hop/`). Optional: AUR PKGBUILD.
