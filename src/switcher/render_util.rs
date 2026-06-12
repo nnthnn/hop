@@ -6,7 +6,6 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::error::Error;
-use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Arc, CreateGCAux, ChangeGCAux, Rectangle};
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt,
@@ -16,6 +15,7 @@ use x11rb::protocol::render::{
 use x11rb::rust_connection::RustConnection;
 
 use super::PictCtx;
+use super::resource::{PixmapGuard, GcGuard, PictureGuard};
 
 /// Downscale `pixels` (packed ARGB u32, `src_w × src_h`) to `dst_w × dst_h`
 /// by averaging each output pixel's contributing source region.
@@ -168,18 +168,15 @@ pub(super) fn draw_filled_rounded_rect(
         return Ok(());
     }
 
-    let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, ctx.drawable, wu, hu)?;
-    let gc = conn.generate_id()?;
-    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?;
-    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?;
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?;
-    fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, wu, hu, radius)?;
-    conn.free_gc(gc)?;
+    let mask_pix = PixmapGuard::create(conn, 8, ctx.drawable, wu, hu)?;
+    let gc = GcGuard::create(conn, mask_pix.id, &CreateGCAux::new().foreground(0u32))?;
+    conn.poly_fill_rectangle(mask_pix.id, gc.id, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?;
+    conn.change_gc(gc.id, &ChangeGCAux::new().foreground(255u32))?;
+    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, 0, 0, wu, hu, radius)?;
+    drop(gc);
 
-    composite_color_through_mask(conn, ctx, x, y, wu, hu, mask_pix, color_argb)?;
-    conn.free_pixmap(mask_pix)?;
-    Ok(())
+    composite_color_through_mask(conn, ctx, x, y, wu, hu, mask_pix.id, color_argb)?;
+    Ok(()) // mask_pix freed on drop
 }
 
 /// Composite a solid color through a ring-shaped A8 mask onto `dst_pic` (OVER).
@@ -204,27 +201,24 @@ pub(super) fn draw_border_ring(
     let owu = ow as u16;
     let ohu = oh as u16;
 
-    let mask_pix = conn.generate_id()?;
-    conn.create_pixmap(8, mask_pix, ctx.drawable, owu, ohu)?;
-    let gc = conn.generate_id()?;
-    conn.create_gc(gc, mask_pix, &CreateGCAux::new().foreground(0u32))?;
+    let mask_pix = PixmapGuard::create(conn, 8, ctx.drawable, owu, ohu)?;
+    let gc = GcGuard::create(conn, mask_pix.id, &CreateGCAux::new().foreground(0u32))?;
     // Clear mask to 0.
-    conn.poly_fill_rectangle(mask_pix, gc, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?;
+    conn.poly_fill_rectangle(mask_pix.id, gc.id, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?;
     // Paint outer rounded rect with 255.
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?;
-    fill_rounded_rect_to_gc(conn, mask_pix, gc, 0, 0, owu, ohu, outer_r)?;
+    conn.change_gc(gc.id, &ChangeGCAux::new().foreground(255u32))?;
+    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, 0, 0, owu, ohu, outer_r)?;
     // Punch out inner rounded rect with 0.
     let iw = ow.saturating_sub(2 * fw) as u16;
     let ih = oh.saturating_sub(2 * fw) as u16;
     if iw > 0 && ih > 0 {
-        conn.change_gc(gc, &ChangeGCAux::new().foreground(0u32))?;
-        fill_rounded_rect_to_gc(conn, mask_pix, gc, fw as i16, fw as i16, iw, ih, inner_r)?;
+        conn.change_gc(gc.id, &ChangeGCAux::new().foreground(0u32))?;
+        fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, fw as i16, fw as i16, iw, ih, inner_r)?;
     }
-    conn.free_gc(gc)?;
+    drop(gc);
 
-    composite_color_through_mask(conn, ctx, ox, oy, owu, ohu, mask_pix, color_argb)?;
-    conn.free_pixmap(mask_pix)?;
-    Ok(())
+    composite_color_through_mask(conn, ctx, ox, oy, owu, ohu, mask_pix.id, color_argb)?;
+    Ok(()) // mask_pix freed on drop
 }
 
 /// Composite `color_argb` through an existing A8 `mask_pix` onto `ctx.pic` using OVER.
@@ -240,35 +234,29 @@ pub(super) fn composite_color_through_mask(
     mask_pix: u32,
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
-    let mask_pic = conn.generate_id()?;
-    conn.render_create_picture(mask_pic, mask_pix, ctx.a8_fmt, &CreatePictureAux::new())?;
+    // mask_pix is owned by the caller; we only wrap it in a picture here.
+    let mask_pic = PictureGuard::create(conn, mask_pix, ctx.a8_fmt, &CreatePictureAux::new())?;
 
-    let src_pix = conn.generate_id()?;
-    conn.create_pixmap(32, src_pix, ctx.drawable, 1, 1)?;
-    let src_pic = conn.generate_id()?;
-    conn.render_create_picture(src_pic, src_pix, ctx.argb_fmt,
+    let src_pix = PixmapGuard::create(conn, 32, ctx.drawable, 1, 1)?;
+    let src_pic = PictureGuard::create(conn, src_pix.id, ctx.argb_fmt,
         &CreatePictureAux::new().repeat(Repeat::NORMAL))?;
-    conn.free_pixmap(src_pix)?;
 
     let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
     conn.render_fill_rectangles(
-        PictOp::SRC, src_pic,
+        PictOp::SRC, src_pic.id,
         RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
         &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
     )?;
 
     conn.render_composite(
         PictOp::OVER,
-        src_pic, mask_pic, ctx.pic,
+        src_pic.id, mask_pic.id, ctx.pic,
         0, 0,  // src x, y  (1×1 with repeat)
         0, 0,  // mask x, y
         x, y,  // dst x, y
         w, h,
     )?;
-
-    conn.render_free_picture(src_pic)?;
-    conn.render_free_picture(mask_pic)?;
-    Ok(())
+    Ok(()) // src_pix + pictures freed on drop
 }
 
 /// Convert a packed 0xAARRGGBB u32 into XRender color components (0–0xFFFF each).

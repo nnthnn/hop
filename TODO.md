@@ -7,7 +7,8 @@ per-`show()` monitor/grid caching (hot-path round-trip removal), the
 `parse_net_wm_icon` overflow fix, consistent screen handling, strict multi-modifier
 binding matching, log-and-continue event-loop resilience, hardened picom-config
 matching (comment/prefix-collision aware), config validation (`Config::validate()`
-with fall-back-to-defaults), and a unit-test suite covering the pure
+with fall-back-to-defaults), RAII guards for short-lived render resources
+(`switcher/resource.rs`), and a unit-test suite covering the pure
 color/icon/text/picom/validation logic.
 
 ---
@@ -21,11 +22,6 @@ color/icon/text/picom/validation logic.
 ---
 
 ## Nice-to-Have
-
-- [ ] **RAII wrappers for X11 resources**
-  In error paths inside `draw_icon()` and similar functions, a pixmap or GC could be
-  leaked if an early return fires before the matching `free_*` call. Low risk (X11 cleans
-  up on disconnect) but a small RAII guard would make it bulletproof.
 
 - [ ] **Reduce remaining wide signatures**
   `draw_pixels_scaled`, `composite_color_through_mask`, and `draw_border_ring` still take

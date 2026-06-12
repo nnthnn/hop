@@ -3,6 +3,7 @@
 mod icons;
 mod text_util;
 mod render_util;
+mod resource;
 
 use icons::load_icon_file;
 use text_util::{open_core_font, truncate_title, wrap_text_xft, resolve_shadow_color};
@@ -11,6 +12,7 @@ use render_util::{
     fill_rounded_rect_to_gc, draw_filled_rounded_rect, draw_border_ring,
     argb_to_render_color,
 };
+use resource::{PixmapGuard, GcGuard, PictureGuard};
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -914,47 +916,43 @@ impl<'a> Switcher<'a> {
         };
         let (src_w, src_h) = (*src_w, *src_h);
 
-        // Upload pixels into a 32-bit pixmap
-        let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
-
-        let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
+        // Upload pixels into a 32-bit pixmap. Guards free the pixmap/GC/picture on
+        // drop, so an early `?` below can't leak them.
+        let pixmap = PixmapGuard::create(self.conn, 32, ctx.drawable, src_w as u16, src_h as u16)?;
+        let gc = GcGuard::create(self.conn, pixmap.id, &CreateGCAux::new().foreground(0).background(0))?;
 
         // Vec<u32> ARGB pixels → native-endian bytes (matches XRender ARGB32 layout)
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
         self.conn.put_image(
             ImageFormat::Z_PIXMAP,
-            pixmap, gc,
+            pixmap.id, gc.id,
             src_w as u16, src_h as u16,
             0i16, 0i16,  // dst_x, dst_y
             0u8,         // left_pad
             32u8,        // depth
             &bytes,
         )?;
-        self.conn.free_gc(gc)?;
+        drop(gc); // GC is only needed for the upload
 
         // Create an XRender Picture for the pixmap
-        let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
-        self.conn.free_pixmap(pixmap)?;
+        let icon_pic = PictureGuard::create(self.conn, pixmap.id, ctx.argb_fmt, &CreatePictureAux::new())?;
 
         // Scale to icon_size if the source dimensions differ
         if src_w != icon_size || src_h != icon_size {
             let sx = (src_w as i64 * 65536 / icon_size as i64) as i32;
             let sy = (src_h as i64 * 65536 / icon_size as i64) as i32;
-            self.conn.render_set_picture_transform(icon_pic, Transform {
+            self.conn.render_set_picture_transform(icon_pic.id, Transform {
                 matrix11: sx, matrix12: 0, matrix13: 0,
                 matrix21: 0, matrix22: sy, matrix23: 0,
                 matrix31: 0, matrix32: 0, matrix33: 65536,
             })?;
-            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?;
+            self.conn.render_set_picture_filter(icon_pic.id, b"bilinear", &[])?;
         }
 
         // Composite icon OVER the tile
         self.conn.render_composite(
             PictOp::OVER,
-            icon_pic,
+            icon_pic.id,
             0u32,        // mask = None
             ctx.pic,
             0, 0,        // src_x, src_y
@@ -962,9 +960,7 @@ impl<'a> Switcher<'a> {
             icon_x, icon_y,
             icon_size as u16, icon_size as u16,
         )?;
-
-        self.conn.render_free_picture(icon_pic)?;
-        Ok(())
+        Ok(()) // pixmap + icon_pic freed on drop
     }
 
     /// Draw a small app icon in the bottom-right corner of the tile content area,
@@ -994,43 +990,36 @@ impl<'a> Switcher<'a> {
         let ov_x = tile.x + pad as i16 + avail_w as i16 - ov_size as i16 - margin;
         let ov_y = tile.y + pad as i16 + avail_h as i16 - ov_size as i16 - margin;
 
-        // Upload icon pixels into a temporary pixmap.
-        let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
-        let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
+        // Upload icon pixels into a temporary pixmap (guarded against leaks on `?`).
+        let pixmap = PixmapGuard::create(self.conn, 32, ctx.drawable, src_w as u16, src_h as u16)?;
+        let gc = GcGuard::create(self.conn, pixmap.id, &CreateGCAux::new().foreground(0).background(0))?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
-        self.conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc,
+        self.conn.put_image(ImageFormat::Z_PIXMAP, pixmap.id, gc.id,
             src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes)?;
-        self.conn.free_gc(gc)?;
+        drop(gc); // GC is only needed for the upload
 
-        let icon_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(icon_pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
-        self.conn.free_pixmap(pixmap)?;
+        let icon_pic = PictureGuard::create(self.conn, pixmap.id, ctx.argb_fmt, &CreatePictureAux::new())?;
 
         // Scale to ov_size if needed.
         if src_w != ov_size || src_h != ov_size {
             let sx = (src_w as i64 * 65536 / ov_size as i64) as i32;
             let sy = (src_h as i64 * 65536 / ov_size as i64) as i32;
-            self.conn.render_set_picture_transform(icon_pic, Transform {
+            self.conn.render_set_picture_transform(icon_pic.id, Transform {
                 matrix11: sx, matrix12: 0, matrix13: 0,
                 matrix21: 0, matrix22: sy, matrix23: 0,
                 matrix31: 0, matrix32: 0, matrix33: 65536,
             })?;
-            self.conn.render_set_picture_filter(icon_pic, b"bilinear", &[])?;
+            self.conn.render_set_picture_filter(icon_pic.id, b"bilinear", &[])?;
         }
 
         // Build a 1×1 A8 alpha-mask picture with repeat, giving 80% opacity.
-        let alpha_pix = self.conn.generate_id()?;
-        self.conn.create_pixmap(8, alpha_pix, ctx.drawable, 1, 1)?;
-        let alpha_pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(
-            alpha_pic, alpha_pix, ctx.a8_fmt,
+        let alpha_pix = PixmapGuard::create(self.conn, 8, ctx.drawable, 1, 1)?;
+        let alpha_pic = PictureGuard::create(
+            self.conn, alpha_pix.id, ctx.a8_fmt,
             &CreatePictureAux::new().repeat(Repeat::NORMAL),
         )?;
-        self.conn.free_pixmap(alpha_pix)?;
         // 80% opacity: 204/255 * 65535 ≈ 52428 in 16-bit XRender alpha space.
-        self.conn.render_fill_rectangles(PictOp::SRC, alpha_pic,
+        self.conn.render_fill_rectangles(PictOp::SRC, alpha_pic.id,
             RenderColor { red: 0, green: 0, blue: 0, alpha: 52428 },
             &[Rectangle { x: 0, y: 0, width: 1, height: 1 }],
         )?;
@@ -1038,15 +1027,12 @@ impl<'a> Switcher<'a> {
         // Composite icon over the thumbnail with the alpha mask.
         self.conn.render_composite(
             PictOp::OVER,
-            icon_pic, alpha_pic, ctx.pic,
+            icon_pic.id, alpha_pic.id, ctx.pic,
             0, 0, 0, 0,
             ov_x, ov_y,
             ov_size as u16, ov_size as u16,
         )?;
-
-        self.conn.render_free_picture(alpha_pic)?;
-        self.conn.render_free_picture(icon_pic)?;
-        Ok(())
+        Ok(()) // pixmaps + pictures freed on drop
     }
 
     /// Draw a window's thumbnail from the pixel cache into the tile content area.
@@ -1602,20 +1588,16 @@ impl<'a> Switcher<'a> {
     ) -> Result<(), Box<dyn Error>> {
         if src_w == 0 || src_h == 0 { return Ok(()); }
 
-        let pixmap = self.conn.generate_id()?;
-        self.conn.create_pixmap(32, pixmap, ctx.drawable, src_w as u16, src_h as u16)?;
-        let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0).background(0))?;
+        let pixmap = PixmapGuard::create(self.conn, 32, ctx.drawable, src_w as u16, src_h as u16)?;
+        let gc = GcGuard::create(self.conn, pixmap.id, &CreateGCAux::new().foreground(0).background(0))?;
         let bytes: Vec<u8> = pixels.iter().flat_map(|&p| p.to_ne_bytes()).collect();
         self.conn.put_image(
-            ImageFormat::Z_PIXMAP, pixmap, gc,
+            ImageFormat::Z_PIXMAP, pixmap.id, gc.id,
             src_w as u16, src_h as u16, 0, 0, 0, 32, &bytes,
         )?;
-        self.conn.free_gc(gc)?;
+        drop(gc); // GC is only needed for the upload
 
-        let pic = self.conn.generate_id()?;
-        self.conn.render_create_picture(pic, pixmap, ctx.argb_fmt, &CreatePictureAux::new())?;
-        self.conn.free_pixmap(pixmap)?;
+        let pic = PictureGuard::create(self.conn, pixmap.id, ctx.argb_fmt, &CreatePictureAux::new())?;
 
         let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
         let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
@@ -1625,19 +1607,18 @@ impl<'a> Switcher<'a> {
 
         let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
         let sy = ((src_h as f64 / dst_h as f64) * 65536.0).round() as i32;
-        self.conn.render_set_picture_transform(pic, Transform {
+        self.conn.render_set_picture_transform(pic.id, Transform {
             matrix11: sx, matrix12: 0, matrix13: 0,
             matrix21: 0, matrix22: sy, matrix23: 0,
             matrix31: 0, matrix32: 0, matrix33: 65536,
         })?;
-        self.conn.render_set_picture_filter(pic, b"bilinear", &[])?;
+        self.conn.render_set_picture_filter(pic.id, b"bilinear", &[])?;
 
         self.conn.render_composite(
-            PictOp::OVER, pic, 0u32, ctx.pic,
+            PictOp::OVER, pic.id, 0u32, ctx.pic,
             0, 0, 0, 0, dst_x, dst_y, dst_w as u16, dst_h as u16,
         )?;
-        self.conn.render_free_picture(pic)?;
-        Ok(())
+        Ok(()) // pixmap + pic freed on drop
     }
 
     pub fn popup_window(&self) -> Option<Window> {
