@@ -43,6 +43,11 @@ const MAX_THUMB_CACHE: usize = 64;
 #[derive(Clone, Copy)]
 struct TileGeom { x: i16, y: i16, w: u32, h: u32 }
 
+/// A rectangle in popup-relative pixels. Shared geometry argument for the render
+/// helpers, replacing their separate `x, y, w, h` parameters.
+#[derive(Clone, Copy)]
+struct Rect { x: i16, y: i16, w: u32, h: u32 }
+
 /// XRender destination picture, format IDs, and backing drawable.
 /// Bundled to avoid threading 4 related values through every draw function.
 #[derive(Clone, Copy)]
@@ -604,7 +609,8 @@ impl<'a> Switcher<'a> {
                     &[Rectangle { x: 0, y: 0, width: pw, height: ph }])?.check()?;
                 self.conn.change_gc(gc, &ChangeGCAux::new().foreground(255u32))?.check()?;
                 let clamped_r = win_br.min(pw as u32 / 2).min(ph as u32 / 2);
-                fill_rounded_rect_to_gc(self.conn, mask_pix, gc, 0, 0, pw, ph, clamped_r)?;
+                fill_rounded_rect_to_gc(self.conn, mask_pix, gc,
+                    Rect { x: 0, y: 0, w: pw as u32, h: ph as u32 }, clamped_r)?;
                 self.conn.free_gc(gc)?.check()?;
                 let mask_pic = self.conn.generate_id()?;
                 self.conn.render_create_picture(mask_pic, mask_pix, a8_fmt,
@@ -653,14 +659,13 @@ impl<'a> Switcher<'a> {
                 // Tile background: inner rounded rect, composited OVER window bg.
                 draw_filled_rounded_rect(
                     self.conn, ctx,
-                    tile_x, tile_y, tw, th, inner_r, bg_argb,
+                    Rect { x: tile_x, y: tile_y, w: tw, h: th }, inner_r, bg_argb,
                 )?;
                 // Border ring: outer shape minus inner shape, so it only covers
                 // the fw-wide ring and never overwrites the bg or icon area.
                 draw_border_ring(
                     self.conn, ctx,
-                    tile_x - fw as i16, tile_y - fw as i16,
-                    tw + 2*fw32, th + 2*fw32,
+                    Rect { x: tile_x - fw as i16, y: tile_y - fw as i16, w: tw + 2*fw32, h: th + 2*fw32 },
                     outer_r, fw32, inner_r, border_argb,
                 )?;
             } else {
@@ -709,8 +714,7 @@ impl<'a> Switcher<'a> {
             let inner_r = br.saturating_sub(fw32).min(tw / 2).min(th / 2);
             draw_border_ring(
                 self.conn, ctx,
-                sel_x - fw as i16, sel_y - fw as i16,
-                tw + 2*fw32, th + 2*fw32,
+                Rect { x: sel_x - fw as i16, y: sel_y - fw as i16, w: tw + 2*fw32, h: th + 2*fw32 },
                 outer_r, fw32, inner_r, frame_argb,
             )?;
         } else {
@@ -865,8 +869,7 @@ impl<'a> Switcher<'a> {
                 draw_border_ring(
                     self.conn,
                     PictCtx { pic: pix_pic, argb_fmt, a8_fmt, drawable: pixmap },
-                    tile_x - fw as i16, tile_y - fw as i16,
-                    tw + 2*fw32, th + 2*fw32,
+                    Rect { x: tile_x - fw as i16, y: tile_y - fw as i16, w: tw + 2*fw32, h: th + 2*fw32 },
                     outer_r, fw32, inner_r, border_argb,
                 )?;
             } else {
@@ -1062,8 +1065,8 @@ impl<'a> Switcher<'a> {
         }
 
         if let Some((cw, ch, cpixels)) = self.thumb_cache.get(&entry.frame) {
-            self.draw_pixels_scaled(ctx, cpixels, *cw, *ch,
-                tile.x, tile.y, avail_w, avail_h, pad)?;
+            let dst = Rect { x: tile.x, y: tile.y, w: avail_w, h: avail_h };
+            self.draw_pixels_scaled(ctx, cpixels, *cw, *ch, dst, pad)?;
             return Ok(true);
         }
 
@@ -1569,21 +1572,15 @@ impl<'a> Switcher<'a> {
     }
 
     /// Upload ARGB pixel data into a temporary pixmap, scale it to fit within
-    /// `(avail_w × avail_h)` preserving aspect ratio, and composite OVER `pix_pic`.
-    /// Used to render cached thumbnails for off-desktop windows.
-    // Wide positional signature (geometry + pixels); folding into a Rect struct is
-    // tracked in TODO.md alongside the other drawing helpers.
-    #[allow(clippy::too_many_arguments)]
+    /// `dst` (position + available size) preserving aspect ratio, and composite
+    /// OVER `pix_pic`. Used to render cached thumbnails for off-desktop windows.
     fn draw_pixels_scaled(
         &self,
         ctx: PictCtx,
         pixels: &[u32],
         src_w: u32,
         src_h: u32,
-        tile_x: i16,
-        tile_y: i16,
-        avail_w: u32,
-        avail_h: u32,
+        dst: Rect,
         pad: u32,
     ) -> Result<(), Box<dyn Error>> {
         if src_w == 0 || src_h == 0 { return Ok(()); }
@@ -1599,11 +1596,12 @@ impl<'a> Switcher<'a> {
 
         let pic = PictureGuard::create(self.conn, pixmap.id, ctx.argb_fmt, &CreatePictureAux::new())?;
 
+        let (avail_w, avail_h) = (dst.w, dst.h);
         let scale = (src_w as f64 / avail_w as f64).max(src_h as f64 / avail_h as f64);
         let dst_w = ((src_w as f64 / scale).round() as u32).max(1).min(avail_w);
         let dst_h = ((src_h as f64 / scale).round() as u32).max(1).min(avail_h);
-        let dst_x = tile_x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
-        let dst_y = tile_y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
+        let dst_x = dst.x + pad as i16 + (avail_w.saturating_sub(dst_w) / 2) as i16;
+        let dst_y = dst.y + pad as i16 + (avail_h.saturating_sub(dst_h) / 2) as i16;
 
         let sx = ((src_w as f64 / dst_w as f64) * 65536.0).round() as i32;
         let sy = ((src_h as f64 / dst_h as f64) * 65536.0).round() as i32;

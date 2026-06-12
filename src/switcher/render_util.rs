@@ -1,10 +1,5 @@
 //! XRender drawing utilities: pixel scaling, rounded rects, border rings, color conversion.
 
-// These low-level drawing primitives take many positional geometry/color args by
-// nature. Folding them into a TileGeom/Rect-style struct is tracked in TODO.md;
-// until then, allow the wide signatures module-wide.
-#![allow(clippy::too_many_arguments)]
-
 use std::error::Error;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Arc, CreateGCAux, ChangeGCAux, Rectangle};
 use x11rb::protocol::render::{
@@ -14,7 +9,7 @@ use x11rb::protocol::render::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use super::PictCtx;
+use super::{PictCtx, Rect};
 use super::resource::{PixmapGuard, GcGuard, PictureGuard};
 
 /// Downscale `pixels` (packed ARGB u32, `src_w × src_h`) to `dst_w × dst_h`
@@ -115,12 +110,12 @@ pub(super) fn fill_rounded_rect_to_gc(
     conn: &RustConnection,
     pix: u32,
     gc: u32,
-    x: i16,
-    y: i16,
-    w: u16,
-    h: u16,
+    rect: Rect,
     radius: u32,
 ) -> Result<(), Box<dyn Error>> {
+    let (x, y) = (rect.x, rect.y);
+    let w = rect.w as u16;
+    let h = rect.h as u16;
     let r = (radius as u16).min(w / 2).min(h / 2);
     if r == 0 {
         conn.poly_fill_rectangle(pix, gc, &[Rectangle { x, y, width: w, height: h }])?;
@@ -147,16 +142,14 @@ pub(super) fn fill_rounded_rect_to_gc(
 pub(super) fn draw_filled_rounded_rect(
     conn: &RustConnection,
     ctx: PictCtx,
-    x: i16,
-    y: i16,
-    w: u32,
-    h: u32,
+    rect: Rect,
     radius: u32,
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
-    if w == 0 || h == 0 { return Ok(()); }
-    let wu = w as u16;
-    let hu = h as u16;
+    if rect.w == 0 || rect.h == 0 { return Ok(()); }
+    let (x, y) = (rect.x, rect.y);
+    let wu = rect.w as u16;
+    let hu = rect.h as u16;
 
     if radius == 0 {
         let (cr, cg, cb, ca) = argb_to_render_color(color_argb);
@@ -172,34 +165,31 @@ pub(super) fn draw_filled_rounded_rect(
     let gc = GcGuard::create(conn, mask_pix.id, &CreateGCAux::new().foreground(0u32))?;
     conn.poly_fill_rectangle(mask_pix.id, gc.id, &[Rectangle { x: 0, y: 0, width: wu, height: hu }])?;
     conn.change_gc(gc.id, &ChangeGCAux::new().foreground(255u32))?;
-    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, 0, 0, wu, hu, radius)?;
+    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, Rect { x: 0, y: 0, w: rect.w, h: rect.h }, radius)?;
     drop(gc);
 
-    composite_color_through_mask(conn, ctx, x, y, wu, hu, mask_pix.id, color_argb)?;
+    composite_color_through_mask(conn, ctx, rect, mask_pix.id, color_argb)?;
     Ok(()) // mask_pix freed on drop
 }
 
 /// Composite a solid color through a ring-shaped A8 mask onto `dst_pic` (OVER).
 ///
 /// The ring = outer rounded rect minus the inner rounded rect punched out.
-/// `(ox, oy, ow, oh)` is the outer rect; the inner rect is inset by `fw` on all sides.
+/// `outer` is the outer rect; the inner rect is inset by `fw` on all sides.
 /// `outer_r` is the corner radius of the outer edge; `inner_r` for the inner edge
 /// (typically `outer_r - fw`, or 0 when `outer_r <= fw`).
 pub(super) fn draw_border_ring(
     conn: &RustConnection,
     ctx: PictCtx,
-    ox: i16,
-    oy: i16,
-    ow: u32,
-    oh: u32,
+    outer: Rect,
     outer_r: u32,
     fw: u32,
     inner_r: u32,
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
-    if ow == 0 || oh == 0 { return Ok(()); }
-    let owu = ow as u16;
-    let ohu = oh as u16;
+    if outer.w == 0 || outer.h == 0 { return Ok(()); }
+    let owu = outer.w as u16;
+    let ohu = outer.h as u16;
 
     let mask_pix = PixmapGuard::create(conn, 8, ctx.drawable, owu, ohu)?;
     let gc = GcGuard::create(conn, mask_pix.id, &CreateGCAux::new().foreground(0u32))?;
@@ -207,17 +197,17 @@ pub(super) fn draw_border_ring(
     conn.poly_fill_rectangle(mask_pix.id, gc.id, &[Rectangle { x: 0, y: 0, width: owu, height: ohu }])?;
     // Paint outer rounded rect with 255.
     conn.change_gc(gc.id, &ChangeGCAux::new().foreground(255u32))?;
-    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, 0, 0, owu, ohu, outer_r)?;
+    fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, Rect { x: 0, y: 0, w: outer.w, h: outer.h }, outer_r)?;
     // Punch out inner rounded rect with 0.
-    let iw = ow.saturating_sub(2 * fw) as u16;
-    let ih = oh.saturating_sub(2 * fw) as u16;
+    let iw = outer.w.saturating_sub(2 * fw);
+    let ih = outer.h.saturating_sub(2 * fw);
     if iw > 0 && ih > 0 {
         conn.change_gc(gc.id, &ChangeGCAux::new().foreground(0u32))?;
-        fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, fw as i16, fw as i16, iw, ih, inner_r)?;
+        fill_rounded_rect_to_gc(conn, mask_pix.id, gc.id, Rect { x: fw as i16, y: fw as i16, w: iw, h: ih }, inner_r)?;
     }
     drop(gc);
 
-    composite_color_through_mask(conn, ctx, ox, oy, owu, ohu, mask_pix.id, color_argb)?;
+    composite_color_through_mask(conn, ctx, outer, mask_pix.id, color_argb)?;
     Ok(()) // mask_pix freed on drop
 }
 
@@ -227,10 +217,7 @@ pub(super) fn draw_border_ring(
 pub(super) fn composite_color_through_mask(
     conn: &RustConnection,
     ctx: PictCtx,
-    x: i16,
-    y: i16,
-    w: u16,
-    h: u16,
+    rect: Rect,
     mask_pix: u32,
     color_argb: u32,
 ) -> Result<(), Box<dyn Error>> {
@@ -251,10 +238,10 @@ pub(super) fn composite_color_through_mask(
     conn.render_composite(
         PictOp::OVER,
         src_pic.id, mask_pic.id, ctx.pic,
-        0, 0,  // src x, y  (1×1 with repeat)
-        0, 0,  // mask x, y
-        x, y,  // dst x, y
-        w, h,
+        0, 0,             // src x, y  (1×1 with repeat)
+        0, 0,             // mask x, y
+        rect.x, rect.y,   // dst x, y
+        rect.w as u16, rect.h as u16,
     )?;
     Ok(()) // src_pix + pictures freed on drop
 }
