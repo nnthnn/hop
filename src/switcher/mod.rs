@@ -34,6 +34,8 @@ use crate::x11 as xh;
 const LABEL_H: u32 = 48;    // pixels reserved at the bottom of each tile for the title label
 const TITLE_MAX_CHARS: usize = 100; // hard cap so absurdly long titles don't bust layout
 const SCREEN_MARGIN: u32 = 40;     // minimum gap (px) between popup edge and screen edge
+/// Number of leading tiles that get a quick-select digit badge (1–9).
+const QUICK_MAX: usize = 9;
 /// Maximum number of entries kept in the thumbnail pixel cache.
 /// Entries for windows not in the current list are evicted first; after that
 /// an arbitrary entry is dropped so the cap is always respected.
@@ -651,6 +653,88 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
+    /// Whether quick-select badges / digit-jump are enabled (current config).
+    pub fn quick_select_enabled(&self) -> bool {
+        self.config.window.quick_select
+    }
+
+    /// Activate the window at visible index `idx` (a quick-select digit target).
+    /// No-op if `idx` is past the end of the current view.
+    pub fn quick_select(&mut self, root: Window, idx: usize) -> Result<(), Box<dyn Error>> {
+        if idx < self.view.len() {
+            self.selected = idx;
+            self.commit(root)?;
+        }
+        Ok(())
+    }
+
+    /// The on-screen badge character for visible index `i` ('1'..='9').
+    fn quick_label(i: usize) -> char {
+        (b'1' + i as u8) as char
+    }
+
+    /// Square badge rect in the top-left corner of a tile's content area.
+    fn quick_badge_rect(&self, tile: TileGeom) -> Rect {
+        let bsz = (self.config.font.size + 12).max(20);
+        Rect { x: tile.x + 4, y: tile.y + 4, w: bsz, h: bsz }
+    }
+
+    /// Draw the quick-select badge background (an opaque accent chip) for a tile.
+    /// Drawn in the XRender pass; the digit is drawn separately via Xft.
+    fn draw_quick_badge_bg(&self, ctx: PictCtx, tile: TileGeom) -> Result<(), Box<dyn Error>> {
+        let r = self.quick_badge_rect(tile);
+        // Opaque frame color so the badge reads clearly over any thumbnail.
+        let color = Config::color_argb(&self.config.tile.frame) | 0xFF00_0000;
+        let radius = if ctx.a8_fmt != 0 { r.w / 3 } else { 0 };
+        draw_filled_rounded_rect(self.conn, ctx, r, radius, color)
+    }
+
+    /// Draw the quick-select digit centered in its badge, via Xft. No-op without Xft.
+    fn draw_quick_badge_text(&self, win: Window, tile: TileGeom, label: char) -> Result<(), Box<dyn Error>> {
+        use std::ffi::CString;
+        use x11::xft;
+        use x11::xrender::XRenderColor;
+        use x11::xrender::_XGlyphInfo as XGlyphInfo;
+
+        let xst = match &self.xft { Some(x) => x, None => return Ok(()) };
+        let r = self.quick_badge_rect(tile);
+
+        let font_pattern = CString::new(format!("{}:size={}", self.config.font.name, self.config.font.size))?;
+        let font = unsafe { xft::XftFontOpenName(xst.display, xst.screen_num, font_pattern.as_ptr()) };
+        if font.is_null() { return Ok(()); }
+
+        // Digit in the (dark) tile background color for contrast against the chip.
+        let argb = Config::color_argb(&self.config.tile.background) | 0xFF00_0000;
+        let rc = XRenderColor {
+            red:   (((argb >> 16) & 0xFF) as u16) * 0x101,
+            green: (((argb >>  8) & 0xFF) as u16) * 0x101,
+            blue:  (( argb        & 0xFF) as u16) * 0x101,
+            alpha: 0xFFFF,
+        };
+        let mut color: xft::XftColor = unsafe { std::mem::zeroed() };
+        unsafe { xft::XftColorAllocValue(xst.display, xst.visual, xst.colormap, &rc, &mut color); }
+
+        let text = [label as u8];
+        let mut ext: XGlyphInfo = unsafe { std::mem::zeroed() };
+        unsafe { xft::XftTextExtentsUtf8(xst.display, font, text.as_ptr(), 1, &mut ext); }
+        let text_w = ext.xOff.max(0) as u32;
+        let line_h = unsafe { (*font).height.max(1) } as u32;
+        let ascent = unsafe { (*font).ascent.max(0) } as i16;
+        // Center within the badge rect.
+        let x = r.x + (r.w.saturating_sub(text_w) / 2) as i16;
+        let y = r.y + ascent + (r.h.saturating_sub(line_h) / 2) as i16;
+
+        let draw = unsafe { xft::XftDrawCreate(xst.display, win as u64, xst.visual, xst.colormap) };
+        unsafe {
+            xft::XftDrawStringUtf8(draw, &color, font, x as i32, y as i32, text.as_ptr(), 1);
+            xft::XftDrawDestroy(draw);
+            xft::XftColorFree(xst.display, xst.visual, xst.colormap, &mut color);
+            xft::XftFontClose(xst.display, font);
+            x11::xlib::XFlush(xst.display);
+        }
+        Ok(())
+    }
+
     /// Full redraw: renders all tiles, icons, and labels into the persistent
     /// off-screen pixmap, then blits it to the window.  The pixmap is kept
     /// alive across calls; it is only freed in `hide()`.
@@ -837,6 +921,11 @@ impl<'a> Switcher<'a> {
             } else {
                 self.draw_icon(ctx, tile, entry, fg_argb)?;
             }
+
+            // Quick-select badge background (digit text drawn in the Xft pass below).
+            if self.config.window.quick_select && i < QUICK_MAX {
+                self.draw_quick_badge_bg(ctx, tile)?;
+            }
         }
 
         // Redraw the selected tile's frame on top so it's never occluded by an
@@ -875,6 +964,10 @@ impl<'a> Switcher<'a> {
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
             let tile = TileGeom { x: tile_x, y: tile_y, w: tw, h: th };
             self.draw_label(pixmap, entry, tile, fg_argb)?;
+            // Quick-select digit, centered in the badge drawn during the XRender pass.
+            if self.config.window.quick_select && i < QUICK_MAX {
+                self.draw_quick_badge_text(pixmap, tile, Self::quick_label(i))?;
+            }
         }
 
         // XSync the Xlib connection: wait for the server to finish all Xft draws
@@ -1014,6 +1107,31 @@ impl<'a> Switcher<'a> {
                 self.conn.render_fill_rectangles(PictOp::OVER, pix_pic,
                     RenderColor { red: cr, green: cg, blue: cb, alpha: ca },
                     &border_rects)?;
+            }
+        }
+
+        // The rounded path's corner-clear above can nibble a badge corner; repaint
+        // badges on the two affected tiles. (The flat path never touches the tile
+        // interior, so badges there are already intact.)
+        if use_rings && self.config.window.quick_select {
+            let ctx = PictCtx { pic: pix_pic, argb_fmt, a8_fmt, drawable: pixmap };
+            let affected = [old_sel, self.selected];
+            for &sel in &affected {
+                if sel < QUICK_MAX && sel < self.view.len() {
+                    let (tx, ty) = self.tile_pos(sel, n_cols);
+                    self.draw_quick_badge_bg(ctx, TileGeom { x: tx, y: ty, w: tw, h: th })?;
+                }
+            }
+            self.conn.flush()?;
+            for &sel in &affected {
+                if sel < QUICK_MAX && sel < self.view.len() {
+                    let (tx, ty) = self.tile_pos(sel, n_cols);
+                    self.draw_quick_badge_text(pixmap, TileGeom { x: tx, y: ty, w: tw, h: th },
+                        Self::quick_label(sel))?;
+                }
+            }
+            if let Some(ref xft) = self.xft {
+                unsafe { x11::xlib::XSync(xft.display, 0); }
             }
         }
 

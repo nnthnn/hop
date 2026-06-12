@@ -16,6 +16,8 @@ transparency, live window thumbnails, and compositor blur support.
 - **Type-to-filter** — start typing while the popup is open to narrow the list by
   window title or `WM_CLASS` (case-insensitive); Backspace deletes, and the grid
   resizes to fit. Keystrokes that would match nothing are ignored.
+- **Quick-select** — number badges (1–9) on the first nine tiles; press a digit to
+  jump straight to that window (toggle with `window.quick_select`)
 - **Close windows** — the close key (default `Delete`) or a middle-click on a tile
   closes that window via `_NET_CLOSE_WINDOW` without leaving the switcher
 - **Mouse support** — hover to select, click to activate, scroll to cycle

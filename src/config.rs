@@ -53,6 +53,12 @@ pub struct WindowConfig {
     /// Accepted values: "left", "center", "right". Default: "center".
     #[serde(default = "default_last_row_position")]
     pub last_row_position: String,
+    /// Show quick-select number badges (1–9) on the first nine tiles; pressing a
+    /// digit while the popup is open activates that window directly. When enabled,
+    /// digits are reserved for quick-select (they don't go to type-to-filter); set
+    /// false to free the digits for filtering. Default: true.
+    #[serde(default = "default_true")]
+    pub quick_select: bool,
     /// Corner radius for the popup window background (px). 0 = square corners.
     /// Clips the XRender framebuffer to a rounded shape so compositor transparency
     /// shows through at the corners.
@@ -188,6 +194,7 @@ impl Default for WindowConfig {
             gap:                 0,
             padding:             0,
             last_row_position:   default_last_row_position(),
+            quick_select:        true,
             border_radius:       0,
         }
     }

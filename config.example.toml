@@ -11,6 +11,9 @@ border             = "#6272a4ff" # outer border color
 gap                = 0           # extra pixels of space between adjacent tiles
 padding            = 0           # margin around the tile area (extends the window background)
 last_row_position  = "center"    # alignment of tiles in an incomplete last row: left|center|right
+# Show 1-9 badges on the first nine tiles; press a digit to jump straight to that
+# window. When true, digits are reserved for quick-select (not type-to-filter).
+quick_select       = true
 border_radius      = 0           # corner radius for the popup background (px); 0 = square corners
 # Popup background — visible in the border and gap areas around/between tiles.
 # Default is fully transparent ("00" alpha) so the compositor shows through.

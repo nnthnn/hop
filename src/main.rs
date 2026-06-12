@@ -112,6 +112,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     switcher.commit(root)?;
                 } else if sym == XK_BACKSPACE && switcher.is_visible() {
                     switcher.pop_filter()?;
+                } else if switcher.is_visible() && switcher.quick_select_enabled()
+                    && (0x31..=0x39).contains(&sym) {
+                    // Digits 1–9 jump directly to that tile (quick-select). When
+                    // quick-select is on, digits are reserved for this and don't filter.
+                    switcher.quick_select(root, (sym - 0x31) as usize)?;
                 } else if switcher.is_visible() && (0x20..=0x7e).contains(&sym) {
                     // Any other printable key (incl. space) is type-to-filter input.
                     // Navigation/control keys live in the 0xff00 range, so they're
