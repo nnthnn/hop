@@ -9,12 +9,17 @@ use x11rb::protocol::Event;
 
 use config::Config;
 use x11::Display;
-use switcher::Switcher;
+use switcher::{Switcher, NavDir};
 
 // Return/Enter always commits, regardless of binding config.
 const XK_RETURN: u32 = 0xff0d;
 // Backspace deletes the last character of the type-to-filter query.
 const XK_BACKSPACE: u32 = 0xff08;
+// Arrow keys for 2D grid navigation.
+const XK_LEFT:  u32 = 0xff51;
+const XK_UP:    u32 = 0xff52;
+const XK_RIGHT: u32 = 0xff53;
+const XK_DOWN:  u32 = 0xff54;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let debug = std::env::var("HOP_DEBUG").is_ok();
@@ -106,6 +111,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else if sym == cancel_sym && switcher.is_visible() {
                     switcher.cancel()?;
+                } else if sym == XK_LEFT && switcher.is_visible() {
+                    switcher.navigate(NavDir::Left)?;
+                } else if sym == XK_RIGHT && switcher.is_visible() {
+                    switcher.navigate(NavDir::Right)?;
+                } else if sym == XK_UP && switcher.is_visible() {
+                    switcher.navigate(NavDir::Up)?;
+                } else if sym == XK_DOWN && switcher.is_visible() {
+                    switcher.navigate(NavDir::Down)?;
                 } else if sym == close_sym && switcher.is_visible() {
                     switcher.close_selected(root)?;
                 } else if sym == XK_RETURN && switcher.is_visible() {

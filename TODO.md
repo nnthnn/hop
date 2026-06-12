@@ -12,7 +12,8 @@ fall-back-to-defaults), RAII guards for short-lived render resources
 (`switcher/resource.rs`), folding the render helpers' wide positional geometry
 args into a shared `Rect` struct (no more `too_many_arguments` allows), a
 unit-test suite covering the pure color/icon/text/validation logic, and the
-type-to-filter / quick-select / close-window feature set.
+type-to-filter / quick-select / close-window feature set, and 2D arrow-key
+grid navigation.
 
 ---
 
@@ -20,8 +21,6 @@ type-to-filter / quick-select / close-window feature set.
 
 ### Backlog
 
-- [ ] **2D arrow-key navigation** — Up/Down/Left/Right move by grid row/column instead of
-  only linear next/prev.
 - [ ] **App exclude list** — `[filter] exclude_classes = ["..."]` to skip specific apps by
   `WM_CLASS`, layered onto the existing window-type skip filter.
 - [ ] **Urgent-window highlight** — draw tiles with `_NET_WM_STATE_DEMANDS_ATTENTION` in a

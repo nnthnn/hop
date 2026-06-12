@@ -20,6 +20,7 @@ transparency, live window thumbnails, and compositor blur support.
   jump straight to that window (toggle with `window.quick_select`)
 - **Close windows** — the close key (default `Delete`) or a middle-click on a tile
   closes that window via `_NET_CLOSE_WINDOW` without leaving the switcher
+- **Navigation** — Tab/Shift+Tab to cycle, or arrow keys to move across the grid
 - **Mouse support** — hover to select, click to activate, scroll to cycle
 - **Multi-monitor** — the popup centers on the monitor under the pointer
 - **Configurable keybindings** — modifier, next, prev, cancel, and close keys via TOML

@@ -64,6 +64,10 @@ struct PictCtx {
     drawable: Window,
 }
 
+/// Direction for 2D arrow-key navigation across the tile grid.
+#[derive(Clone, Copy)]
+pub enum NavDir { Left, Right, Up, Down }
+
 pub struct WindowEntry {
     pub id: Window,
     pub name: String,
@@ -1539,6 +1543,30 @@ impl<'a> Switcher<'a> {
         self.selected = self.selected.checked_sub(1).unwrap_or(self.view.len() - 1);
         if self.debug { eprintln!("[hop] prev(): {old} → {}", self.selected); }
         self.border_redraw(old)
+    }
+
+    /// 2D arrow-key navigation across the grid. Left/Right move by one tile,
+    /// Up/Down by a full row; all four clamp at the edges (no wrap). Moving off
+    /// the grid (e.g. down into a missing last-row cell) is a no-op.
+    pub fn navigate(&mut self, dir: NavDir) -> Result<(), Box<dyn Error>> {
+        if self.view.is_empty() { return Ok(()); }
+        let (n_cols, _) = self.grid_layout();
+        let n = self.view.len();
+        let cur = self.selected;
+        let target = match dir {
+            NavDir::Left  => cur.saturating_sub(1),
+            NavDir::Right => (cur + 1).min(n - 1),
+            NavDir::Up    => cur.checked_sub(n_cols).unwrap_or(cur),
+            NavDir::Down  => {
+                let down = cur + n_cols;
+                if down < n { down } else { cur }
+            }
+        };
+        if target != cur {
+            self.selected = target;
+            self.border_redraw(cur)?;
+        }
+        Ok(())
     }
 
     /// Hide popup and switch to the selected window.
