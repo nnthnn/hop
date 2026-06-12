@@ -281,6 +281,8 @@ fn keysym_from_name(name: &str) -> u32 {
         "Tab"               => 0xff09,
         "Escape" | "Esc"    => 0xff1b,
         "Return" | "Enter"  => 0xff0d,
+        "Delete" | "Del"    => 0xffff,
+        "BackSpace"         => 0xff08,
         "space"  | "Space"  => 0x0020,
         "grave"  | "quoteleft" => 0x0060,  // backtick / tilde key
         "F1"  => 0xffbe, "F2"  => 0xffbf, "F3"  => 0xffc0, "F4"  => 0xffc1,
@@ -534,6 +536,34 @@ pub fn activate_window(
         window,
         type_: naw,
         data: [2, x11rb::CURRENT_TIME, 0, 0, 0].into(),
+    };
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?.check()?;
+    conn.flush()?;
+    Ok(())
+}
+
+/// Ask the window manager to close `window` via the `_NET_CLOSE_WINDOW` client
+/// message (the polite EWMH close — the app may still prompt to confirm).
+pub fn close_window(
+    conn: &RustConnection,
+    root: Window,
+    window: Window,
+) -> Result<(), Box<dyn Error>> {
+    use x11rb::protocol::xproto::{EventMask, ClientMessageEvent, CLIENT_MESSAGE_EVENT};
+    let ncw = intern_atom(conn, "_NET_CLOSE_WINDOW")?;
+    let event = ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window,
+        type_: ncw,
+        // data: [timestamp, source indication (2 = pager/pe), 0, 0, 0]
+        data: [x11rb::CURRENT_TIME, 2, 0, 0, 0].into(),
     };
     conn.send_event(
         false,

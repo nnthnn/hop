@@ -68,3 +68,6 @@ modifier = "Alt"
 next     = "Tab"
 prev     = "Shift+Tab"
 cancel   = "Escape"
+# Close the selected window (sends _NET_CLOSE_WINDOW) while the popup is open.
+# Middle-clicking a tile does the same.
+close    = "Delete"

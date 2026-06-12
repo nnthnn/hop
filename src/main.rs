@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (next_sym, next_extra) = x11::parse_key_binding(&config.keys.next);
     let (prev_sym, prev_extra) = x11::parse_key_binding(&config.keys.prev);
     let (cancel_sym, _)        = x11::parse_key_binding(&config.keys.cancel);
+    let (close_sym, _)         = x11::parse_key_binding(&config.keys.close);
     let release_syms           = x11::modifier_release_keysyms(&config.keys.modifier);
 
     eprintln!("hop: listening for {}+{}...", config.keys.modifier, config.keys.next);
@@ -103,6 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else if sym == cancel_sym && switcher.is_visible() {
                     switcher.cancel()?;
+                } else if sym == close_sym && switcher.is_visible() {
+                    switcher.close_selected(root)?;
                 } else if sym == XK_RETURN && switcher.is_visible() {
                     switcher.commit(root)?;
                 }
@@ -136,6 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Event::ButtonPress(ev) => {
                 if switcher.is_visible() {
                     match ev.detail {
+                        2 => switcher.close_at(root, ev.event_x, ev.event_y)?,  // middle-click
                         4 => switcher.prev()?,   // scroll up
                         5 => switcher.next()?,   // scroll down
                         _ => switcher.click_at(root, ev.event_x, ev.event_y)?,

@@ -485,25 +485,7 @@ impl<'a> Switcher<'a> {
         self.conn.change_property8(PropMode::REPLACE, win, wm_class, AtomEnum::STRING, class_str)?
             .check()?;
 
-        if self.config.window.blur || self.config.tile.blur {
-            // When only tile blur is requested, pass individual tile rectangles so the
-            // compositor blurs only behind each tile — not the gaps between them.
-            // When window blur is set (or both), pass an empty slice (= whole window).
-            let rects: Vec<(i16, i16, u16, u16)> = if !self.config.window.blur && self.config.tile.blur {
-                let (n_cols, _) = self.grid_layout();
-                let tw = self.tile_w();
-                let th = self.tile_h();
-                self.windows.iter().enumerate()
-                    .map(|(i, _)| {
-                        let (tx, ty) = self.tile_pos(i, n_cols);
-                        (tx, ty, tw as u16, th as u16)
-                    })
-                    .collect()
-            } else {
-                vec![]  // empty = whole window
-            };
-            xh::set_blur_hint(self.conn, win, &rects)?;
-        }
+        self.apply_blur_hint(win)?;
 
         self.conn.map_window(win)?.check()?;
         self.conn.flush()?;
@@ -514,6 +496,73 @@ impl<'a> Switcher<'a> {
             .reply()?;
 
         self.popup = Some(win);
+        Ok(())
+    }
+
+    /// Set (or clear) the compositor blur-behind hint for the current layout.
+    /// Whole-window blur passes an empty region; tile-only blur passes per-tile rects.
+    fn apply_blur_hint(&self, win: Window) -> Result<(), Box<dyn Error>> {
+        if !(self.config.window.blur || self.config.tile.blur) {
+            return Ok(());
+        }
+        // When only tile blur is requested, pass individual tile rectangles so the
+        // compositor blurs only behind each tile — not the gaps between them.
+        // When window blur is set (or both), pass an empty slice (= whole window).
+        let rects: Vec<(i16, i16, u16, u16)> = if !self.config.window.blur && self.config.tile.blur {
+            let (n_cols, _) = self.grid_layout();
+            let tw = self.tile_w();
+            let th = self.tile_h();
+            self.windows.iter().enumerate()
+                .map(|(i, _)| {
+                    let (tx, ty) = self.tile_pos(i, n_cols);
+                    (tx, ty, tw as u16, th as u16)
+                })
+                .collect()
+        } else {
+            vec![]  // empty = whole window
+        };
+        xh::set_blur_hint(self.conn, win, &rects)
+    }
+
+    /// Recompute the grid for the current window set, resize/reposition the popup
+    /// to match, refresh the blur hint, and repaint. Used after the visible set
+    /// changes while the popup is open (e.g. a window is closed).
+    fn relayout(&mut self) -> Result<(), Box<dyn Error>> {
+        let win = match self.popup { Some(w) => w, None => return Ok(()) };
+        self.cached_grid = Some(self.compute_grid_layout());
+        let (x, y, w, h) = self.popup_dims();
+        self.conn.configure_window(win, &ConfigureWindowAux::new()
+            .x(x as i32).y(y as i32).width(w as u32).height(h as u32))?;
+        self.apply_blur_hint(win)?;
+        self.redraw()
+    }
+
+    /// Close the currently selected window via `_NET_CLOSE_WINDOW`, drop its tile
+    /// from the visible set, and relayout. Hides the popup if it was the last one.
+    pub fn close_selected(&mut self, root: Window) -> Result<(), Box<dyn Error>> {
+        if self.windows.is_empty() { return Ok(()); }
+        let entry = self.windows.remove(self.selected);
+        xh::close_window(self.conn, root, entry.id)?;
+        if self.debug { eprintln!("[hop] close_selected: closed {:#x}", entry.id); }
+
+        if self.windows.is_empty() {
+            return self.hide();
+        }
+        // Keep the selection in range; prefer staying at the same slot.
+        if self.selected >= self.windows.len() {
+            self.selected = self.windows.len() - 1;
+        }
+        // Drop now-stale enrich-queue indices and re-point at the trimmed list.
+        self.enrich_queue = (0..self.windows.len()).collect();
+        self.relayout()
+    }
+
+    /// Close whichever tile is under popup-relative (px, py), if any.
+    pub fn close_at(&mut self, root: Window, px: i16, py: i16) -> Result<(), Box<dyn Error>> {
+        if let Some(idx) = self.tile_at(px, py) {
+            self.selected = idx;
+            self.close_selected(root)?;
+        }
         Ok(())
     }
 

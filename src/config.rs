@@ -134,6 +134,10 @@ pub struct KeysConfig {
     pub prev: String,
     #[serde(default = "default_cancel_key")]
     pub cancel: String,
+    /// Key that closes the selected window (sends _NET_CLOSE_WINDOW) while the
+    /// popup is open. Combined with the modifier just like next/prev.
+    #[serde(default = "default_close_key")]
+    pub close: String,
 }
 
 // -- defaults --
@@ -170,6 +174,7 @@ fn default_modifier() -> String { "Alt".into() }
 fn default_next_key() -> String { "Tab".into() }
 fn default_prev_key() -> String { "Shift+Tab".into() }
 fn default_cancel_key() -> String { "Escape".into() }
+fn default_close_key() -> String { "Delete".into() }
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -225,6 +230,7 @@ impl Default for KeysConfig {
             next:     default_next_key(),
             prev:     default_prev_key(),
             cancel:   default_cancel_key(),
+            close:    default_close_key(),
         }
     }
 }
