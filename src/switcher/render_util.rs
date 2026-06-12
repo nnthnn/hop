@@ -284,3 +284,33 @@ pub(super) fn argb_to_render_color(argb: u32) -> (u16, u16, u16, u16) {
     let premul = |c: u16| (c as u32 * a as u32 / 255) as u16 * 0x101;
     (premul(r), premul(g), premul(b), alpha)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downscale_uniform_color_is_preserved() {
+        let src = vec![0xFF80_4020u32; 4]; // 2×2, all the same
+        assert_eq!(downscale_argb(&src, 2, 2, 1, 1), vec![0xFF80_4020]);
+    }
+
+    #[test]
+    fn downscale_averages_two_pixels() {
+        // 2×1 black + white → 1×1 mid-grey, alpha preserved.
+        let src = vec![0xFF00_0000u32, 0xFFFF_FFFF];
+        assert_eq!(downscale_argb(&src, 2, 1, 1, 1), vec![0xFF7F_7F7F]);
+    }
+
+    #[test]
+    fn argb_to_render_color_opaque_white() {
+        // Opaque white → full-scale on every channel.
+        assert_eq!(argb_to_render_color(0xFFFFFFFF), (0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF));
+    }
+
+    #[test]
+    fn argb_to_render_color_premultiplies() {
+        // Fully transparent → all components zero regardless of color.
+        assert_eq!(argb_to_render_color(0x00FF00FF), (0, 0, 0, 0));
+    }
+}

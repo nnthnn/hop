@@ -109,6 +109,13 @@ pub struct Switcher<'a> {
     /// never changes for the connection, so caching it avoids a big round-trip on
     /// every redraw — notably once per thumbnail during progressive loading.
     cached_formats: Option<std::rc::Rc<x11rb::protocol::render::QueryPictFormatsReply>>,
+    /// Monitor the popup is shown on, captured once per show() from the pointer
+    /// position. Cached so layout doesn't re-query Xinerama + pointer (3 round-trips)
+    /// on every grid_layout()/popup_dims() call. Cleared in hide().
+    cached_monitor: Option<xh::MonitorGeom>,
+    /// Grid (cols, rows) for the current window set; computed once per show() and
+    /// reused by the many callers that need it. Cleared in hide().
+    cached_grid: Option<(usize, usize)>,
 }
 
 impl<'a> Switcher<'a> {
@@ -153,6 +160,8 @@ impl<'a> Switcher<'a> {
             thumb_cache: HashMap::new(),
             enrich_queue: VecDeque::new(),
             cached_formats: None,
+            cached_monitor: None,
+            cached_grid: None,
         })
     }
 
@@ -283,6 +292,11 @@ impl<'a> Switcher<'a> {
             return Ok(());
         }
 
+        // Capture the monitor + grid once now, up front, so every later layout call
+        // this session reuses them instead of re-querying Xinerama/pointer.
+        self.cached_monitor = Some(self.query_current_monitor());
+        self.cached_grid = Some(self.compute_grid_layout());
+
         if backward {
             self.selected = self.windows.len() - 1;
         } else {
@@ -319,8 +333,14 @@ impl<'a> Switcher<'a> {
         Ok(())
     }
 
-    /// Get the monitor that currently contains the mouse pointer.
+    /// Monitor the popup is laid out on. Returns the value cached at show() time;
+    /// falls back to a live query if called before show() populates the cache.
     fn current_monitor(&self) -> xh::MonitorGeom {
+        self.cached_monitor.unwrap_or_else(|| self.query_current_monitor())
+    }
+
+    /// Query the monitor that currently contains the mouse pointer (round-trips).
+    fn query_current_monitor(&self) -> xh::MonitorGeom {
         let monitors = xh::query_monitors(self.conn, self.screen_w, self.screen_h);
         let (px, py) = xh::pointer_position(self.conn, self.root);
         xh::monitor_at(&monitors, px, py)
@@ -334,9 +354,15 @@ impl<'a> Switcher<'a> {
     fn win_pad(&self) -> u32 { self.config.window.padding }
     fn border_radius(&self) -> u32 { self.config.tile.border_radius }
 
+    /// Grid (cols, rows) for the current window set. Returns the value cached at
+    /// show() time; falls back to computing it if the cache isn't populated yet.
+    fn grid_layout(&self) -> (usize, usize) {
+        self.cached_grid.unwrap_or_else(|| self.compute_grid_layout())
+    }
+
     /// Compute how many columns (and resulting rows) fit without the popup
     /// getting within SCREEN_MARGIN pixels of the monitor edges.
-    fn grid_layout(&self) -> (usize, usize) {
+    fn compute_grid_layout(&self) -> (usize, usize) {
         let n = self.windows.len();
         if n == 0 { return (1, 0); }
         let tw  = self.tile_w();
@@ -435,7 +461,7 @@ impl<'a> Switcher<'a> {
         self.conn.create_window(
             32,                          // depth
             win,
-            self.conn.setup().roots[0].root,
+            self.root,
             x, y, w, h,
             outer_bw as u16,
             WindowClass::INPUT_OUTPUT,
@@ -1314,6 +1340,8 @@ impl<'a> Switcher<'a> {
         }
         self.windows.clear();
         self.enrich_queue.clear();
+        self.cached_monitor = None;
+        self.cached_grid = None;
         Ok(())
     }
 

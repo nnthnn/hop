@@ -132,7 +132,18 @@ pub struct Display {
 
 impl Display {
     pub fn connect() -> Result<Self, Box<dyn Error>> {
-        let (conn, screen_num) = RustConnection::connect(None)?;
+        let (conn, screen_num) = RustConnection::connect(None).map_err(|e| {
+            // The default Debug format hides the server's reason (e.g. a stale
+            // XAUTHORITY cookie). Surface it, plus the env we tried, via Display.
+            let display = std::env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
+            let xauth = std::env::var("XAUTHORITY").unwrap_or_else(|_| "(unset)".into());
+            format!(
+                "cannot connect to X server: {e} \
+                 (DISPLAY={display}, XAUTHORITY={xauth}); \
+                 if this terminal predates your current login session its X cookie \
+                 may be stale — try a fresh terminal"
+            )
+        })?;
         let screen = &conn.setup().roots[screen_num].clone();
         let root = screen.root;
         let screen_width = screen.width_in_pixels;
@@ -281,6 +292,51 @@ fn keysym_from_name(name: &str) -> u32 {
     }
 }
 
+/// Cached keyboard mapping: keycode → keysym lookup without a server round-trip.
+///
+/// `get_keyboard_mapping` is otherwise issued on every KeyPress/KeyRelease, adding a
+/// blocking round-trip to each navigation step. The mapping is static for the session
+/// except across `MappingNotify`, so we load it once and `reload()` when notified.
+pub struct KeyMap {
+    min_keycode: u8,
+    per_code: usize,
+    keysyms: Vec<u32>,
+}
+
+impl KeyMap {
+    pub fn load(conn: &RustConnection) -> Result<Self, Box<dyn Error>> {
+        let min = conn.setup().min_keycode;
+        let max = conn.setup().max_keycode;
+        let count = max - min + 1;
+        let m = conn.get_keyboard_mapping(min, count)?.reply()?;
+        Ok(KeyMap {
+            min_keycode: min,
+            per_code: m.keysyms_per_keycode as usize,
+            keysyms: m.keysyms,
+        })
+    }
+
+    /// Re-fetch the mapping after a `MappingNotify`. Leaves the old mapping intact on error.
+    pub fn reload(&mut self, conn: &RustConnection) {
+        if let Ok(fresh) = Self::load(conn) {
+            *self = fresh;
+        }
+    }
+
+    /// Column-0 (unshifted) keysym for `keycode`, or 0 if out of range.
+    ///
+    /// We always use column 0 because modifier state is tracked separately via
+    /// `ev.state` bitmasks. Using the shifted column would turn Shift+Tab into
+    /// ISO_Left_Tab (0xfe20) instead of Tab (0xff09), breaking reverse navigation.
+    pub fn keysym(&self, keycode: u8) -> u32 {
+        if keycode < self.min_keycode || self.per_code == 0 {
+            return 0;
+        }
+        let idx = (keycode - self.min_keycode) as usize * self.per_code;
+        self.keysyms.get(idx).copied().unwrap_or(0)
+    }
+}
+
 /// Look up the keycode for a given keysym by scanning the keyboard mapping.
 fn keysym_to_keycode(conn: &RustConnection, keysym: u32) -> Result<Option<Keycode>, Box<dyn Error>> {
     if keysym == 0 { return Ok(None); }
@@ -346,7 +402,10 @@ pub fn parse_net_wm_icon(data: &[u32], target_size: u32) -> Option<(u32, u32, Ve
         let w = data[i];
         let h = data[i + 1];
         i += 2;
-        if i + (w * h) as usize > data.len() {
+        // Widen before multiplying: `w * h` as u32 can overflow on a corrupt or
+        // hostile property (panic in debug, wrong bounds in release).
+        let count = w as usize * h as usize;
+        if i + count > data.len() {
             break;
         }
         let is_better = best.is_none_or(|(bw, _, _)| {
@@ -357,11 +416,11 @@ pub fn parse_net_wm_icon(data: &[u32], target_size: u32) -> Option<(u32, u32, Ve
         if is_better {
             best = Some((w, h, i));
         }
-        i += (w * h) as usize;
+        i += count;
     }
 
     best.map(|(w, h, offset)| {
-        let pixels = data[offset..offset + (w * h) as usize].to_vec();
+        let pixels = data[offset..offset + w as usize * h as usize].to_vec();
         (w, h, pixels)
     })
 }
@@ -599,4 +658,93 @@ pub fn monitor_at(monitors: &[MonitorGeom], x: i16, y: i16) -> MonitorGeom {
         })
         .copied()
         .unwrap_or(monitors[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wm_class_picks_second_part() {
+        // WM_CLASS is "instance\0class\0".
+        assert_eq!(parse_wm_class(b"ghostty\0Ghostty\0").as_deref(), Some("Ghostty"));
+    }
+
+    #[test]
+    fn wm_class_falls_back_to_first_when_no_second() {
+        assert_eq!(parse_wm_class(b"only\0").as_deref(), Some("only"));
+        assert_eq!(parse_wm_class(b"noterminator").as_deref(), Some("noterminator"));
+    }
+
+    #[test]
+    fn wm_class_empty_is_none() {
+        assert_eq!(parse_wm_class(b""), None);
+        assert_eq!(parse_wm_class(b"\0\0"), None);
+    }
+
+    #[test]
+    fn net_wm_icon_picks_closest_size() {
+        // Two icons: 1x1 (pixel 0xAA) then 2x2 (pixels 0xB0..0xB3).
+        let data = [1, 1, 0xAA, 2, 2, 0xB0, 0xB1, 0xB2, 0xB3];
+        let (w, h, px) = parse_net_wm_icon(&data, 2).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![0xB0, 0xB1, 0xB2, 0xB3]);
+
+        let (w, h, px) = parse_net_wm_icon(&data, 1).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(px, vec![0xAA]);
+    }
+
+    #[test]
+    fn net_wm_icon_prefers_larger_on_tie() {
+        // target 3 is equidistant from 2 and 4; the tie-break keeps the larger.
+        let data = [2, 2, 1, 2, 3, 4, 4, 4, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+        let (w, h, _) = parse_net_wm_icon(&data, 3).unwrap();
+        assert_eq!((w, h), (4, 4));
+    }
+
+    #[test]
+    fn net_wm_icon_empty_is_none() {
+        assert_eq!(parse_net_wm_icon(&[], 64), None);
+    }
+
+    #[test]
+    fn net_wm_icon_truncated_block_is_ignored() {
+        // Declares 4x4 = 16 pixels but only 2 follow — must not panic or over-read.
+        let data = [4, 4, 0x11, 0x22];
+        assert_eq!(parse_net_wm_icon(&data, 4), None);
+    }
+
+    #[test]
+    fn net_wm_icon_overflowing_dimensions_dont_panic() {
+        // w * h overflows u32 (0x10000 * 0x10000); widening must prevent a panic
+        // and the block is rejected because the pixels don't follow.
+        let data = [0x10000, 0x10000, 0xDE, 0xAD];
+        assert_eq!(parse_net_wm_icon(&data, 64), None);
+    }
+
+    #[test]
+    fn modifier_mask_known_names() {
+        assert_eq!(modifier_mask("Super"), modifier_mask("Win"));
+        assert_eq!(modifier_mask("Ctrl"), modifier_mask("Control"));
+        // Unknown names fall back to Alt (M1).
+        assert_eq!(modifier_mask("Alt"), modifier_mask("whatever"));
+    }
+
+    #[test]
+    fn key_binding_parses_modifier_prefix() {
+        let (sym_tab, extra_none) = parse_key_binding("Tab");
+        assert_eq!(sym_tab, 0xff09);
+        assert_eq!(extra_none, 0);
+
+        let (sym, extra) = parse_key_binding("Shift+Tab");
+        assert_eq!(sym, 0xff09);
+        assert_eq!(extra, modifier_mask("Shift"));
+    }
+
+    #[test]
+    fn key_binding_single_ascii_char() {
+        let (sym, _) = parse_key_binding("a");
+        assert_eq!(sym, 'a' as u32);
+    }
 }

@@ -311,3 +311,51 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_argb_rrggbbaa() {
+        // Packed as 0xAARRGGBB: rr=28 gg=2a bb=36 aa=ff
+        assert_eq!(Config::color_argb("#282a36ff"), 0xFF282A36);
+        assert_eq!(Config::color_argb("#28323ccc"), 0xCC28323C);
+        // Fully transparent.
+        assert_eq!(Config::color_argb("#00000000"), 0x0000_0000);
+    }
+
+    #[test]
+    fn color_argb_rrggbb_is_opaque() {
+        assert_eq!(Config::color_argb("#282a36"), 0xFF282A36);
+        assert_eq!(Config::color_argb("#ffffff"), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn color_argb_leading_hash_optional() {
+        assert_eq!(Config::color_argb("282a36"), Config::color_argb("#282a36"));
+        assert_eq!(Config::color_argb("282a36ff"), Config::color_argb("#282a36ff"));
+    }
+
+    #[test]
+    fn color_argb_invalid_falls_back_to_opaque_black() {
+        assert_eq!(Config::color_argb(""), 0xFF000000);
+        assert_eq!(Config::color_argb("#fff"), 0xFF000000); // wrong length
+        assert_eq!(Config::color_argb("not-a-color"), 0xFF000000);
+    }
+
+    #[test]
+    fn color_argb_bad_hex_digits_default_per_channel() {
+        // Non-hex channels parse to 0; alpha defaults to 0xff for the 8-digit form.
+        assert_eq!(Config::color_argb("#zzzzzz"), 0xFF000000);
+    }
+
+    #[test]
+    fn defaults_load_without_a_config_file() {
+        // Default config should be constructible and have sane keybindings.
+        let c = Config::default();
+        assert_eq!(c.keys.modifier, "Alt");
+        assert_eq!(c.keys.next, "Tab");
+        assert_eq!(c.tile.width, 200);
+    }
+}

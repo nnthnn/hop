@@ -1,9 +1,13 @@
 # hop — TODO
 
-Open items only. Completed bugs, cleanups, and the switcher submodule split
-(`mod.rs` + `icons.rs` / `render_util.rs` / `text_util.rs`), the bounded
-thumbnail cache, config-driven keybindings, and `window.position` are all done —
-see git history.
+Open items only. Completed work (see git history): the switcher submodule split
+(`mod.rs` + `icons.rs` / `render_util.rs` / `text_util.rs`), the bounded thumbnail
+cache, config-driven keybindings, `window.position`, a cached keyboard mapping and
+per-`show()` monitor/grid caching (hot-path round-trip removal), the
+`parse_net_wm_icon` overflow fix, consistent screen handling, strict multi-modifier
+binding matching, log-and-continue event-loop resilience, hardened picom-config
+matching (comment/prefix-collision aware), and a unit-test suite covering the pure
+color/icon/text/picom logic.
 
 ---
 

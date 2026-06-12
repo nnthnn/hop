@@ -158,3 +158,47 @@ pub(super) fn resolve_shadow_color(shadow_color_str: &str, fg_argb: u32) -> u32 
         Config::color_argb(shadow_color_str)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_titles_untouched() {
+        assert_eq!(truncate_title("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_trims_surrounding_whitespace() {
+        assert_eq!(truncate_title("  hi  ", 100), "hi");
+    }
+
+    #[test]
+    fn truncate_long_title_appends_ellipsis() {
+        // 10 chars, cap 5 → keep (5-3)=2 chars + "...".
+        assert_eq!(truncate_title("abcdefghij", 5), "ab...");
+    }
+
+    #[test]
+    fn truncate_exactly_at_limit_is_kept() {
+        assert_eq!(truncate_title("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn wcag_shadow_is_dark_for_light_fg() {
+        // White foreground → dark (black) shadow.
+        assert_eq!(wcag_shadow_argb(0xFFFFFFFF), 0xCC000000);
+    }
+
+    #[test]
+    fn wcag_shadow_is_light_for_dark_fg() {
+        // Black foreground → light (white) shadow.
+        assert_eq!(wcag_shadow_argb(0xFF000000), 0xCCFFFFFF);
+    }
+
+    #[test]
+    fn resolve_shadow_auto_vs_explicit() {
+        assert_eq!(resolve_shadow_color("auto", 0xFFFFFFFF), wcag_shadow_argb(0xFFFFFFFF));
+        assert_eq!(resolve_shadow_color("#112233", 0), Config::color_argb("#112233"));
+    }
+}

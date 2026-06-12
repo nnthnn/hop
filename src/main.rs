@@ -51,6 +51,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     eprintln!("hop: listening for {}+{}...", config.keys.modifier, config.keys.next);
 
+    // Load the keyboard mapping once; refreshed on MappingNotify. Avoids a
+    // blocking get_keyboard_mapping round-trip on every key event.
+    let mut keymap = x11::KeyMap::load(&display.conn)?;
+
     let mut switcher = Switcher::new(&display.conn, config, &display)?;
     let root = display.root;
 
@@ -64,18 +68,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             Some(display.conn.wait_for_event()?)
         };
 
-        if let Some(event) = maybe_event { match event {
+        // Dispatch each event inside a closure so a transient X error (e.g. a
+        // BadWindow race when a window vanishes mid-property-fetch) is logged and
+        // the daemon keeps running, rather than propagating out of main() and
+        // silently killing Alt+Tab. Connection-level failures from poll/wait above
+        // stay fatal — a dead connection should exit.
+        if let Some(event) = maybe_event {
+        let handled: Result<(), Box<dyn Error>> = (|| { match event {
             Event::KeyPress(ev) => {
-                let sym  = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
+                let sym  = keymap.keysym(ev.detail);
                 let mods = u32::from(ev.state);
                 let primary_active = mods & primary_mask != 0;
 
-                // is_prev: primary active + all prev extra mods active
+                // is_prev: primary active + ALL prev extra mods active. Requiring the
+                // full mask (== prev_extra) means a two-modifier binding like
+                // Ctrl+Shift+Tab needs both bits, not just one. (prev_extra == 0
+                // trivially satisfies the equality.)
                 let is_prev = sym == prev_sym && primary_active
-                    && (prev_extra == 0 || mods & prev_extra != 0);
-                // is_next: primary active, not prev (when same base key), + next extra mods active
+                    && (mods & prev_extra) == prev_extra;
+                // is_next: primary active, not prev (when same base key), + all next extra mods active
                 let is_next = sym == next_sym && primary_active && !is_prev
-                    && (next_extra == 0 || mods & next_extra != 0);
+                    && (mods & next_extra) == next_extra;
 
                 if is_next {
                     if !switcher.is_visible() {
@@ -97,10 +110,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             Event::KeyRelease(ev) => {
-                let sym = keycode_to_keysym(&display.conn, ev.detail, ev.state)?;
+                let sym = keymap.keysym(ev.detail);
                 if release_syms.contains(&sym) && switcher.is_visible() {
                     switcher.commit(root)?;
                 }
+            }
+
+            // The keyboard layout changed (e.g. setxkbmap); refresh our cached mapping.
+            Event::MappingNotify(_) => {
+                keymap.reload(&display.conn);
             }
 
             Event::MotionNotify(ev) => {
@@ -139,12 +157,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             _ => {}
-        } } // end match event / if let Some(event)
+        } Ok(()) })(); // end match event, invoke dispatch closure
+            if let Err(e) = handled {
+                eprintln!("hop: recovered from error handling event: {e}");
+            }
+        } // end if let Some(event)
 
         // Progressive enrichment: load one window's icon + thumbnail per loop
         // iteration. Runs only while the popup is visible and the queue is non-empty.
+        // Errors here are non-fatal too — log and keep going.
         if switcher.has_pending_enrich() {
-            switcher.pump_one_enrich()?;
+            if let Err(e) = switcher.pump_one_enrich() {
+                eprintln!("hop: recovered from enrich error: {e}");
+            }
         }
     }
 }
@@ -257,14 +282,37 @@ fn find_picom_config() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Find the byte offset of a real `list_key = [ ... ]` assignment in `content`.
+///
+/// Skips commented-out lines and substring matches inside comments, and guards
+/// against prefix collisions (e.g. `blur-background` must not match
+/// `blur-background-exclude`) by requiring the next non-space char to be `=`.
+/// Returns the offset of the key itself.
+fn find_list_assignment(content: &str, list_key: &str) -> Option<usize> {
+    let mut line_start = 0;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            if let Some(rest) = trimmed.strip_prefix(list_key) {
+                if rest.trim_start().starts_with('=') {
+                    let indent = line.len() - trimmed.len();
+                    return Some(line_start + indent);
+                }
+            }
+        }
+        line_start += line.len() + 1; // +1 for '\n'
+    }
+    None
+}
+
 /// Check whether hop's rule is currently in a named picom exclude list.
 fn is_in_picom_exclude(content: &str, list_key: &str) -> bool {
     // Check for a block we appended.
     if content.contains(&format!("\n# Added by hop\n{list_key} = [")) {
         return true;
     }
-    // Check inside an existing user-written list.
-    if let Some(kw_pos) = content.find(list_key) {
+    // Check inside an existing user-written list (real assignment only, not a comment).
+    if let Some(kw_pos) = find_list_assignment(content, list_key) {
         let after = &content[kw_pos..];
         if let Some(open_rel) = after.find('[') {
             let open_abs = kw_pos + open_rel + 1;
@@ -283,7 +331,7 @@ fn is_in_picom_exclude(content: &str, list_key: &str) -> bool {
 fn patch_picom_exclude(content: &str, list_key: &str) -> String {
     let rule = "\"class_g = 'hop'\"";
 
-    if let Some(kw_pos) = content.find(list_key) {
+    if let Some(kw_pos) = find_list_assignment(content, list_key) {
         let after = &content[kw_pos..];
         if let Some(open_rel) = after.find('[') {
             let open_abs = kw_pos + open_rel + 1;
@@ -398,19 +446,84 @@ fn set_picom_setting(content: &mut String, key: &str, value: &str) -> bool {
     true
 }
 
-/// Translate a keycode into an unshifted keysym.
-/// We always use column 0 (unshifted) because modifier state is tracked
-/// separately via ev.state bitmasks. Using the shifted column causes
-/// Shift+Tab to return ISO_Left_Tab (0xfe20) instead of Tab (0xff09),
-/// which breaks Alt+Shift+Tab reverse navigation.
-fn keycode_to_keysym(
-    conn: &x11rb::rust_connection::RustConnection,
-    keycode: u8,
-    _state: KeyButMask,
-) -> Result<u32, Box<dyn Error>> {
-    let mapping = conn.get_keyboard_mapping(keycode, 1)?.reply()?;
-    if mapping.keysyms.is_empty() {
-        return Ok(0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_patch_then_detect_then_remove_roundtrip() {
+        let key = "blur-background-exclude";
+        let patched = patch_picom_exclude("", key);
+        assert!(is_in_picom_exclude(&patched, key));
+        assert!(patched.contains("class_g = 'hop'"));
+
+        let removed = remove_picom_exclude(&patched, key);
+        assert!(!is_in_picom_exclude(&removed, key));
     }
-    Ok(mapping.keysyms[0])
+
+    #[test]
+    fn exclude_patch_into_existing_list_preserves_other_rules() {
+        let existing = "shadow-exclude = [\n  \"class_g = 'foo'\"\n];\n";
+        let patched = patch_picom_exclude(existing, "shadow-exclude");
+        assert!(patched.contains("class_g = 'hop'"));
+        assert!(patched.contains("class_g = 'foo'")); // not clobbered
+        assert!(is_in_picom_exclude(&patched, "shadow-exclude"));
+    }
+
+    #[test]
+    fn set_setting_appends_when_absent_and_is_idempotent() {
+        let mut c = String::new();
+        assert!(set_picom_setting(&mut c, "blur-method", "\"dual_kawase\""));
+        assert!(c.contains("blur-method = \"dual_kawase\";"));
+        // Second call with the same value reports no change.
+        assert!(!set_picom_setting(&mut c, "blur-method", "\"dual_kawase\""));
+    }
+
+    #[test]
+    fn set_setting_replaces_existing_value() {
+        let mut c = String::from("blur-strength = 3;\n");
+        assert!(set_picom_setting(&mut c, "blur-strength", "5"));
+        assert!(c.contains("blur-strength = 5;"));
+        assert!(!c.contains("= 3;"));
+    }
+
+    #[test]
+    fn set_setting_does_not_match_prefix_collision() {
+        // "blur-background" must not match the "blur-background-exclude" line.
+        let mut c = String::from("blur-background-exclude = [];\n");
+        assert!(set_picom_setting(&mut c, "blur-background", "true"));
+        assert!(c.contains("blur-background = true;"));
+        assert!(c.contains("blur-background-exclude = [];")); // untouched
+    }
+
+    #[test]
+    fn exclude_ignores_commented_out_list() {
+        // A commented exclude line must not count as a real assignment.
+        let commented = "# blur-background-exclude = [ \"class_g = 'hop'\" ];\n";
+        assert!(!is_in_picom_exclude(commented, "blur-background-exclude"));
+        // Patching appends a fresh block rather than editing the comment.
+        let patched = patch_picom_exclude(commented, "blur-background-exclude");
+        assert!(patched.contains("# Added by hop"));
+        assert!(patched.starts_with(commented)); // original comment left intact
+        assert!(is_in_picom_exclude(&patched, "blur-background-exclude"));
+    }
+
+    #[test]
+    fn find_list_assignment_rejects_prefix_collision() {
+        // "blur-background" must not match the "-exclude" assignment.
+        let content = "blur-background-exclude = [];\n";
+        assert_eq!(find_list_assignment(content, "blur-background"), None);
+        assert!(find_list_assignment(content, "blur-background-exclude").is_some());
+    }
+
+    #[test]
+    fn ensure_blur_on_sets_all_three_then_noop() {
+        let out = ensure_picom_blur_on("", "dual_kawase", 5).expect("should change empty config");
+        assert!(out.contains("blur-background = true;"));
+        assert!(out.contains("blur-method = \"dual_kawase\";"));
+        assert!(out.contains("blur-strength = 5;"));
+        // Already-correct config → no change.
+        assert!(ensure_picom_blur_on(&out, "dual_kawase", 5).is_none());
+    }
 }
+
