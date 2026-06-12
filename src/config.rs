@@ -259,8 +259,20 @@ impl Config {
     pub fn load() -> Result<Self, Box<dyn Error>> {
         if let Some(path) = Self::config_path() {
             let content = std::fs::read_to_string(&path)?;
-            eprintln!("hop: loaded config from {}", path.display());
-            Ok(toml::from_str(&content)?)
+            let cfg: Config = toml::from_str(&content)?;
+            match cfg.validate() {
+                Ok(()) => {
+                    eprintln!("hop: loaded config from {}", path.display());
+                    Ok(cfg)
+                }
+                Err(msg) => {
+                    // Keep hop usable: warn loudly and fall back to defaults rather
+                    // than refusing to start over a bad field.
+                    eprintln!("hop: invalid config at {}:\n  {msg}", path.display());
+                    eprintln!("hop: using built-in defaults instead");
+                    Ok(Config::default())
+                }
+            }
         } else {
             eprintln!("hop: no config found, using defaults");
             Ok(Config::default())
@@ -286,6 +298,85 @@ impl Config {
     /// Returns the tile background as a packed 0xAARRGGBB value.
     pub fn bg_argb(&self) -> u32 {
         Self::color_argb(&self.tile.background)
+    }
+
+    /// True if `s` is a syntactically valid color: "#rrggbb" or "#rrggbbaa"
+    /// (the leading `#` is optional), all hex digits.
+    fn is_valid_color(s: &str) -> bool {
+        let h = s.trim_start_matches('#');
+        matches!(h.len(), 6 | 8) && h.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Validate the config after deserialization. Returns `Err` with a message
+    /// listing every problem found (one per line). Catches values that would
+    /// otherwise panic (zero divisors for tile/icon scaling) and surfaces likely
+    /// typos in enum-like string fields and colors, which would silently fall back
+    /// to a default and confuse the user.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut errs: Vec<String> = Vec::new();
+
+        // Numeric fields that act as divisors or dimensions — zero would break
+        // layout or panic during icon/thumbnail scaling.
+        if self.tile.width == 0 {
+            errs.push("tile.width must be greater than 0".into());
+        }
+        if self.tile.height == 0 {
+            errs.push("tile.height must be greater than 0".into());
+        }
+        if self.tile.icon_size == 0 {
+            errs.push("tile.icon_size must be greater than 0".into());
+        }
+        if self.font.size == 0 {
+            errs.push("font.size must be greater than 0".into());
+        }
+
+        // Enum-like string fields. The renderer falls back to a default for an
+        // unknown value, so flag it as a likely typo rather than silently ignoring.
+        let check_one = |field: &str, val: &str, allowed: &[&str], errs: &mut Vec<String>| {
+            if !allowed.contains(&val) {
+                errs.push(format!("{field} = \"{val}\" is invalid (expected one of: {})", allowed.join(", ")));
+            }
+        };
+        check_one("window.background_gradient", &self.window.background_gradient,
+            &["none", "radial", "vertical", "horizontal"], &mut errs);
+        check_one("window.last_row_position", &self.window.last_row_position,
+            &["left", "center", "right"], &mut errs);
+        check_one("window.blur_method", &self.window.blur_method,
+            &["dual_kawase", "gaussian", "box", "kernel"], &mut errs);
+        check_one("tile.content", &self.tile.content,
+            &["icon", "thumbnail"], &mut errs);
+
+        // Position: either "center" or a parseable "x,y" pair.
+        let pos = self.window.position.trim();
+        let pos_ok = pos == "center"
+            || pos.split_once(',').is_some_and(|(x, y)| {
+                x.trim().parse::<i16>().is_ok() && y.trim().parse::<i16>().is_ok()
+            });
+        if !pos_ok {
+            errs.push(format!("window.position = \"{pos}\" is invalid (expected \"center\" or \"x,y\")"));
+        }
+
+        // Colors. shadow_color additionally accepts the special value "auto".
+        for (field, val) in [
+            ("window.background", &self.window.background),
+            ("window.border", &self.window.border),
+            ("tile.background", &self.tile.background),
+            ("tile.foreground", &self.tile.foreground),
+            ("tile.frame", &self.tile.frame),
+            ("tile.inactive", &self.tile.inactive),
+        ] {
+            if !Self::is_valid_color(val) {
+                errs.push(format!("{field} = \"{val}\" is not a valid color (expected #rrggbb or #rrggbbaa)"));
+            }
+        }
+        if self.font.shadow_color != "auto" && !Self::is_valid_color(&self.font.shadow_color) {
+            errs.push(format!(
+                "font.shadow_color = \"{}\" is invalid (expected \"auto\", #rrggbb, or #rrggbbaa)",
+                self.font.shadow_color
+            ));
+        }
+
+        if errs.is_empty() { Ok(()) } else { Err(errs.join("\n  ")) }
     }
 
     /// Parse any color string into a packed 0xAARRGGBB value.
@@ -357,5 +448,65 @@ mod tests {
         assert_eq!(c.keys.modifier, "Alt");
         assert_eq!(c.keys.next, "Tab");
         assert_eq!(c.tile.width, 200);
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_dimensions() {
+        let mut c = Config::default();
+        c.tile.icon_size = 0;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("tile.icon_size"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_enum_value() {
+        let mut c = Config::default();
+        c.tile.content = "screenshot".into(); // not "icon"/"thumbnail"
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("tile.content"));
+    }
+
+    #[test]
+    fn validate_position_center_or_xy() {
+        let mut c = Config::default();
+        c.window.position = "center".into();
+        assert!(c.validate().is_ok());
+        c.window.position = "100,200".into();
+        assert!(c.validate().is_ok());
+        c.window.position = "top-left".into();
+        assert!(c.validate().unwrap_err().contains("window.position"));
+    }
+
+    #[test]
+    fn validate_colors_and_auto_shadow() {
+        let mut c = Config::default();
+        c.font.shadow_color = "auto".into();
+        assert!(c.validate().is_ok());
+        c.tile.frame = "purple".into();
+        assert!(c.validate().unwrap_err().contains("tile.frame"));
+    }
+
+    #[test]
+    fn validate_reports_multiple_problems_at_once() {
+        let mut c = Config::default();
+        c.tile.width = 0;
+        c.window.blur_method = "blurry".into();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("tile.width"));
+        assert!(err.contains("window.blur_method"));
+    }
+
+    #[test]
+    fn valid_color_helper() {
+        assert!(Config::is_valid_color("#282a36"));
+        assert!(Config::is_valid_color("#282a36ff"));
+        assert!(Config::is_valid_color("282a36")); // # optional
+        assert!(!Config::is_valid_color("#fff"));   // wrong length
+        assert!(!Config::is_valid_color("#zzzzzz")); // non-hex
     }
 }

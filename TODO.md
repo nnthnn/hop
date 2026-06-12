@@ -6,8 +6,9 @@ cache, config-driven keybindings, `window.position`, a cached keyboard mapping a
 per-`show()` monitor/grid caching (hot-path round-trip removal), the
 `parse_net_wm_icon` overflow fix, consistent screen handling, strict multi-modifier
 binding matching, log-and-continue event-loop resilience, hardened picom-config
-matching (comment/prefix-collision aware), and a unit-test suite covering the pure
-color/icon/text/picom logic.
+matching (comment/prefix-collision aware), config validation (`Config::validate()`
+with fall-back-to-defaults), and a unit-test suite covering the pure
+color/icon/text/picom/validation logic.
 
 ---
 
@@ -20,10 +21,6 @@ color/icon/text/picom logic.
 ---
 
 ## Nice-to-Have
-
-- [ ] **Config validation**
-  Add `Config::validate()` that checks sanity of numeric fields (e.g. `icon_size > 0`,
-  `border_width` not absurdly large) and returns `Err` with a helpful message.
 
 - [ ] **RAII wrappers for X11 resources**
   In error paths inside `draw_icon()` and similar functions, a pixmap or GC could be
