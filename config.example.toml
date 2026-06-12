@@ -74,3 +74,10 @@ cancel   = "Escape"
 # Close the selected window (sends _NET_CLOSE_WINDOW) while the popup is open.
 # Middle-clicking a tile does the same.
 close    = "Delete"
+# Same-app cycling: this binding opens the popup filtered to only the windows of
+# the currently-active app (same WM_CLASS). Set app_next = "" to disable it (then
+# hop won't grab the binding). If your WM already owns this combo, free it first —
+# otherwise hop logs a warning and skips the grab.
+app_modifier = "Super"
+app_next     = "Tab"
+app_prev     = "Shift+Tab"

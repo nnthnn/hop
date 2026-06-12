@@ -144,6 +144,18 @@ pub struct KeysConfig {
     /// popup is open. Combined with the modifier just like next/prev.
     #[serde(default = "default_close_key")]
     pub close: String,
+
+    /// Modifier for same-app window cycling (opens the popup filtered to the
+    /// currently-active app's windows). Default: "Super".
+    #[serde(default = "default_app_modifier")]
+    pub app_modifier: String,
+    /// Forward key for same-app cycling. Set to "" to disable app-mode entirely
+    /// (then hop won't grab the app keybinding). Default: "Tab".
+    #[serde(default = "default_next_key")]
+    pub app_next: String,
+    /// Reverse key for same-app cycling. Default: "Shift+Tab".
+    #[serde(default = "default_prev_key")]
+    pub app_prev: String,
 }
 
 // -- defaults --
@@ -181,6 +193,7 @@ fn default_next_key() -> String { "Tab".into() }
 fn default_prev_key() -> String { "Shift+Tab".into() }
 fn default_cancel_key() -> String { "Escape".into() }
 fn default_close_key() -> String { "Delete".into() }
+fn default_app_modifier() -> String { "Super".into() }
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -233,11 +246,14 @@ impl Default for FontConfig {
 impl Default for KeysConfig {
     fn default() -> Self {
         KeysConfig {
-            modifier: default_modifier(),
-            next:     default_next_key(),
-            prev:     default_prev_key(),
-            cancel:   default_cancel_key(),
-            close:    default_close_key(),
+            modifier:     default_modifier(),
+            next:         default_next_key(),
+            prev:         default_prev_key(),
+            cancel:       default_cancel_key(),
+            close:        default_close_key(),
+            app_modifier: default_app_modifier(),
+            app_next:     default_next_key(),
+            app_prev:     default_prev_key(),
         }
     }
 }

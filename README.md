@@ -18,6 +18,8 @@ transparency, live window thumbnails, and compositor blur support.
   resizes to fit. Keystrokes that would match nothing are ignored.
 - **Quick-select** — number badges (1–9) on the first nine tiles; press a digit to
   jump straight to that window (toggle with `window.quick_select`)
+- **Same-app cycling** — a second binding (default `Super+Tab`) opens the popup
+  filtered to just the windows of the currently-active app (same `WM_CLASS`)
 - **Close windows** — the close key (default `Delete`) or a middle-click on a tile
   closes that window via `_NET_CLOSE_WINDOW` without leaving the switcher
 - **Navigation** — Tab/Shift+Tab to cycle, or arrow keys to move across the grid

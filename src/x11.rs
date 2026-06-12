@@ -234,6 +234,11 @@ pub fn parse_key_binding(s: &str) -> (u32, u32) {
 
 /// Grab the configured trigger keys on the root window.
 /// Grabs `modifier+next_key` and `modifier+prev_key` (with all lock-key combos).
+///
+/// A grab that conflicts with another client (BadAccess — e.g. the WM already owns
+/// the combo) is logged and skipped rather than fatal, so one bad binding can't stop
+/// hop from starting or disable the others. An empty/unknown key is silently skipped,
+/// which is how app-mode is disabled (`app_next = ""`).
 pub fn grab_keys(
     conn: &RustConnection,
     root: Window,
@@ -241,7 +246,7 @@ pub fn grab_keys(
     next_key: &str,
     prev_key: &str,
 ) -> Result<(), Box<dyn Error>> {
-    use x11rb::protocol::xproto::{GrabMode, ModMask};
+    use x11rb::protocol::xproto::ModMask;
 
     let primary     = ModMask::from(modifier_mask(modifier) as u16);
     let (next_sym, next_extra_u32) = parse_key_binding(next_key);
@@ -250,23 +255,39 @@ pub fn grab_keys(
     let prev_extra  = ModMask::from(prev_extra_u32 as u16);
 
     if let Some(next_code) = keysym_to_keycode(conn, next_sym)? {
-        for lock in offending_modifiers() {
-            conn.grab_key(true, root, primary | next_extra | lock,
-                next_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
-        }
+        grab_combo(conn, root, primary | next_extra, next_code,
+            &format!("{modifier}+{next_key}"));
     }
 
     // Grab prev separately only when it differs from next in keycode or modifiers.
     if prev_sym != next_sym || prev_extra_u32 != next_extra_u32 {
         if let Some(prev_code) = keysym_to_keycode(conn, prev_sym)? {
-            for lock in offending_modifiers() {
-                conn.grab_key(true, root, primary | prev_extra | lock,
-                    prev_code, GrabMode::ASYNC, GrabMode::ASYNC)?.check()?;
-            }
+            grab_combo(conn, root, primary | prev_extra, prev_code,
+                &format!("{modifier}+{prev_key}"));
         }
     }
 
     Ok(())
+}
+
+/// Grab `base_mods + keycode` across all lock-key combinations. Logs once (and
+/// keeps going) if the grab is rejected, e.g. another program already owns it.
+fn grab_combo(conn: &RustConnection, root: Window, base_mods: ModMask, code: Keycode, label: &str) {
+    use x11rb::protocol::xproto::GrabMode;
+    let mut ok = false;
+    for lock in offending_modifiers() {
+        if let Ok(cookie) = conn.grab_key(true, root, base_mods | lock, code,
+            GrabMode::ASYNC, GrabMode::ASYNC)
+        {
+            if cookie.check().is_ok() {
+                ok = true;
+            }
+        }
+    }
+    if !ok {
+        eprintln!("hop: couldn't grab {label} (already grabbed by another program?); \
+                   that binding is disabled");
+    }
 }
 
 /// Return all modifier combinations to grab (handles NumLock, CapsLock, ScrollLock).
@@ -573,6 +594,33 @@ pub fn close_window(
     )?.check()?;
     conn.flush()?;
     Ok(())
+}
+
+/// Return the currently-active window from `_NET_ACTIVE_WINDOW` on root.
+pub fn get_active_window(conn: &RustConnection, root: Window) -> Option<Window> {
+    let atom = intern_atom(conn, "_NET_ACTIVE_WINDOW").ok()?;
+    if atom == 0 {
+        return None;
+    }
+    let Ok(cookie) = conn.get_property(false, root, atom, AtomEnum::WINDOW, 0, 1) else {
+        return None;
+    };
+    let Ok(reply) = cookie.reply() else { return None; };
+    if reply.format != 32 {
+        return None;
+    }
+    let win = reply.value32()?.next()?;
+    if win == 0 { None } else { Some(win) }
+}
+
+/// Return the class part of `window`'s `WM_CLASS`, lowercased-comparison-ready.
+pub fn window_class(conn: &RustConnection, window: Window) -> Option<String> {
+    let reply = conn
+        .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+        .ok()?
+        .reply()
+        .ok()?;
+    parse_wm_class(&reply.value)
 }
 
 /// Return the `_NET_WM_DESKTOP` index for `window`, or `None` if unset.

@@ -137,6 +137,10 @@ pub struct Switcher<'a> {
     /// layout, navigation, and selection all operate over this view, so filtering
     /// never touches the underlying window list or its cached icons/thumbnails.
     view: Vec<usize>,
+    /// Same-app cycling: when set, the view is restricted to windows whose
+    /// `WM_CLASS` equals this (the active app's class). Combined with `filter`.
+    /// Cleared in hide(), so it only applies for the app-mode session that set it.
+    app_class: Option<String>,
 }
 
 impl<'a> Switcher<'a> {
@@ -185,6 +189,7 @@ impl<'a> Switcher<'a> {
             cached_grid: None,
             filter: String::new(),
             view: Vec::new(),
+            app_class: None,
         })
     }
 
@@ -306,8 +311,27 @@ impl<'a> Switcher<'a> {
             .and_then(|cls| load_icon_file(&cls, icon_size))
     }
 
-    /// Show the popup, starting at the second window (index 1, or 0 if only one).
+    /// Show the popup over every window, starting at the second (index 1, or 0 if one).
     pub fn show(&mut self, root: Window, backward: bool) -> Result<(), Box<dyn Error>> {
+        self.show_with(root, backward, None)
+    }
+
+    /// Show the popup restricted to the windows of the currently-active app
+    /// (same `WM_CLASS`) — the same-app cycling mode. If the active window has no
+    /// class, falls back to showing everything.
+    pub fn show_app(&mut self, root: Window, backward: bool) -> Result<(), Box<dyn Error>> {
+        let class = xh::get_active_window(self.conn, root)
+            .and_then(|w| xh::window_class(self.conn, w));
+        if self.debug {
+            eprintln!("[hop] show_app: active class = {class:?}");
+        }
+        self.show_with(root, backward, class)
+    }
+
+    /// Shared show logic. `app_class = Some(class)` restricts the view to that app.
+    fn show_with(&mut self, root: Window, backward: bool, app_class: Option<String>)
+        -> Result<(), Box<dyn Error>>
+    {
         if self.popup.is_some() {
             return Ok(());
         }
@@ -324,9 +348,17 @@ impl<'a> Switcher<'a> {
             return Ok(());
         }
 
-        // Fresh popup starts unfiltered; view = every window.
+        // Fresh popup starts unfiltered. In app-mode the view is restricted to the
+        // active app's class; the typed filter still narrows on top of that.
+        self.app_class = app_class;
         self.filter.clear();
         self.rebuild_view();
+        if self.view.is_empty() {
+            // App-mode with no matching windows (active window had no class, or none
+            // survived the skip filter). Nothing to show.
+            self.app_class = None;
+            return Ok(());
+        }
 
         // Capture the monitor + grid once now, up front, so every later layout call
         // this session reuses them instead of re-querying Xinerama/pointer.
@@ -374,14 +406,18 @@ impl<'a> Switcher<'a> {
     /// Empty filter shows every window; otherwise a case-insensitive substring
     /// match against each window's title and `WM_CLASS`.
     fn rebuild_view(&mut self) {
-        if self.filter.is_empty() {
-            self.view = (0..self.windows.len()).collect();
-            return;
-        }
+        let app = self.app_class.as_deref();
         let f = self.filter.as_str(); // already lowercased as typed
         self.view = self.windows.iter().enumerate()
             .filter(|(_, e)| {
-                e.name.to_lowercase().contains(f) || e.class.to_lowercase().contains(f)
+                // App-mode: keep only the active app's class (exact, case-insensitive).
+                if let Some(app) = app {
+                    if !e.class.eq_ignore_ascii_case(app) {
+                        return false;
+                    }
+                }
+                // Typed filter: substring match on title or class.
+                f.is_empty() || e.name.to_lowercase().contains(f) || e.class.to_lowercase().contains(f)
             })
             .map(|(i, _)| i)
             .collect();
@@ -1615,6 +1651,7 @@ impl<'a> Switcher<'a> {
         self.cached_grid = None;
         self.filter.clear();
         self.view.clear();
+        self.app_class = None;
         Ok(())
     }
 

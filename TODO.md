@@ -12,8 +12,8 @@ fall-back-to-defaults), RAII guards for short-lived render resources
 (`switcher/resource.rs`), folding the render helpers' wide positional geometry
 args into a shared `Rect` struct (no more `too_many_arguments` allows), a
 unit-test suite covering the pure color/icon/text/validation logic, and the
-type-to-filter / quick-select / close-window feature set, and 2D arrow-key
-grid navigation.
+type-to-filter / quick-select / close-window feature set, 2D arrow-key grid
+navigation, same-app window cycling (Super+Tab), and non-fatal key grabs.
 
 ---
 

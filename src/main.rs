@@ -36,6 +36,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         &display.conn, display.root,
         &config.keys.modifier, &config.keys.next, &config.keys.prev,
     )?;
+    // Same-app cycling keys (e.g. Super+Tab). Skipped when app_next is empty.
+    x11::grab_keys(
+        &display.conn, display.root,
+        &config.keys.app_modifier, &config.keys.app_next, &config.keys.app_prev,
+    )?;
 
     // Select SubstructureNotify on root so we receive MapNotify and DestroyNotify
     // events. These are used to keep the thumbnail cache up to date: MapNotify fires
@@ -56,7 +61,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (close_sym, _)         = x11::parse_key_binding(&config.keys.close);
     let release_syms           = x11::modifier_release_keysyms(&config.keys.modifier);
 
+    // Same-app cycling bindings (app_next == "" disables app-mode).
+    let app_enabled            = !config.keys.app_next.is_empty();
+    let app_primary_mask       = x11::modifier_mask(&config.keys.app_modifier);
+    let (app_next_sym, app_next_extra) = x11::parse_key_binding(&config.keys.app_next);
+    let (app_prev_sym, app_prev_extra) = x11::parse_key_binding(&config.keys.app_prev);
+    let app_release_syms       = x11::modifier_release_keysyms(&config.keys.app_modifier);
+
     eprintln!("hop: listening for {}+{}...", config.keys.modifier, config.keys.next);
+    if app_enabled {
+        eprintln!("hop: same-app cycling on {}+{}", config.keys.app_modifier, config.keys.app_next);
+    }
 
     // Load the keyboard mapping once; refreshed on MappingNotify. Avoids a
     // blocking get_keyboard_mapping round-trip on every key event.
@@ -64,6 +79,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut switcher = Switcher::new(&display.conn, config, &display)?;
     let root = display.root;
+
+    // The modifier-release keysyms that commit the *currently open* popup. Set when
+    // the popup is shown (main vs app mode use different modifiers), read on KeyRelease.
+    let mut opened_release: Vec<u32> = Vec::new();
 
     loop {
         // While thumbnails are loading, poll non-blocking so we can interleave
@@ -97,15 +116,38 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let is_next = sym == next_sym && primary_active && !is_prev
                     && (mods & next_extra) == next_extra;
 
+                // Same-app cycling (e.g. Super+Tab), independent of the main modifier.
+                let app_active = app_enabled && mods & app_primary_mask != 0;
+                let app_is_prev = app_active && sym == app_prev_sym
+                    && (mods & app_prev_extra) == app_prev_extra;
+                let app_is_next = app_active && sym == app_next_sym && !app_is_prev
+                    && (mods & app_next_extra) == app_next_extra;
+
                 if is_next {
                     if !switcher.is_visible() {
                         switcher.show(root, false)?;
+                        opened_release = release_syms.clone();
                     } else {
                         switcher.next()?;
                     }
                 } else if is_prev {
                     if !switcher.is_visible() {
                         switcher.show(root, true)?;
+                        opened_release = release_syms.clone();
+                    } else {
+                        switcher.prev()?;
+                    }
+                } else if app_is_next {
+                    if !switcher.is_visible() {
+                        switcher.show_app(root, false)?;
+                        opened_release = app_release_syms.clone();
+                    } else {
+                        switcher.next()?;
+                    }
+                } else if app_is_prev {
+                    if !switcher.is_visible() {
+                        switcher.show_app(root, true)?;
+                        opened_release = app_release_syms.clone();
                     } else {
                         switcher.prev()?;
                     }
@@ -142,7 +184,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             Event::KeyRelease(ev) => {
                 let sym = keymap.keysym(ev.detail);
-                if release_syms.contains(&sym) && switcher.is_visible() {
+                // Commit when the modifier that opened this popup (main or app mode)
+                // is released.
+                if opened_release.contains(&sym) && switcher.is_visible() {
                     switcher.commit(root)?;
                 }
             }
