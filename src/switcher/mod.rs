@@ -65,6 +65,8 @@ struct PictCtx {
 pub struct WindowEntry {
     pub id: Window,
     pub name: String,
+    /// The window's `WM_CLASS` (class part), used by type-to-filter. May be empty.
+    pub class: String,
     /// Raw ARGB pixels (width * height u32 values) from _NET_WM_ICON, if any.
     pub icon: Option<(u32, u32, Vec<u32>)>,
     /// The WM frame window: the direct child of root that encloses this client.
@@ -123,6 +125,12 @@ pub struct Switcher<'a> {
     /// Grid (cols, rows) for the current window set; computed once per show() and
     /// reused by the many callers that need it. Cleared in hide().
     cached_grid: Option<(usize, usize)>,
+    /// Current type-to-filter query (lowercased as typed). Empty = show everything.
+    filter: String,
+    /// Indices into `windows` that match `filter`, in display order. The popup's
+    /// layout, navigation, and selection all operate over this view, so filtering
+    /// never touches the underlying window list or its cached icons/thumbnails.
+    view: Vec<usize>,
 }
 
 impl<'a> Switcher<'a> {
@@ -169,6 +177,8 @@ impl<'a> Switcher<'a> {
             cached_formats: None,
             cached_monitor: None,
             cached_grid: None,
+            filter: String::new(),
+            view: Vec::new(),
         })
     }
 
@@ -191,11 +201,12 @@ impl<'a> Switcher<'a> {
         let atoms = self.atoms;
         let want_thumbs = self.config.tile.content == "thumbnail";
 
-        // Phase 1: fire off type + name requests without waiting for any reply.
+        // Phase 1: fire off type + name + class requests without waiting for any reply.
         let mut ids: Vec<Window> = Vec::with_capacity(win_ids.len());
         let mut type_cookies     = Vec::with_capacity(win_ids.len());
         let mut net_name_cookies = Vec::with_capacity(win_ids.len());
         let mut wm_name_cookies  = Vec::with_capacity(win_ids.len());
+        let mut wm_class_cookies = Vec::with_capacity(win_ids.len());
 
         for id in win_ids {
             if self.popup == Some(id) {
@@ -205,20 +216,23 @@ impl<'a> Switcher<'a> {
             type_cookies.push(conn.get_property(false, id, atoms.net_wm_window_type, AtomEnum::ATOM, 0, 32)?);
             net_name_cookies.push(conn.get_property(false, id, atoms.net_wm_name, atoms.utf8_string, 0, 256)?);
             wm_name_cookies.push(conn.get_property(false, id, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)?);
+            wm_class_cookies.push(conn.get_property(false, id, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)?);
         }
 
         // Phase 2: collect replies in lockstep and build the kept entries.
         let mut type_it = type_cookies.into_iter();
         let mut net_it  = net_name_cookies.into_iter();
         let mut wmn_it  = wm_name_cookies.into_iter();
+        let mut cls_it  = wm_class_cookies.into_iter();
 
-        // (id, name) for windows that pass the skip filter; icons fill in later.
-        let mut kept: Vec<(Window, String)> = Vec::new();
+        // (id, name, class) for windows that pass the skip filter; icons fill in later.
+        let mut kept: Vec<(Window, String, String)> = Vec::new();
 
         for &id in &ids {
             let type_c = type_it.next().unwrap();
             let net_c  = net_it.next().unwrap();
             let wmn_c  = wmn_it.next().unwrap();
+            let cls_c  = cls_it.next().unwrap();
 
             // Skip panels, docks, desktop windows, etc.
             let types: Vec<u32> = type_c.reply().ok()
@@ -238,20 +252,25 @@ impl<'a> Switcher<'a> {
                     .map(|r| String::from_utf8_lossy(&r.value).into_owned()))
                 .unwrap_or_default();
 
-            kept.push((id, name));
+            // Class for type-to-filter; empty string if WM_CLASS is unset.
+            let class = cls_c.reply().ok()
+                .and_then(|r| xh::parse_wm_class(&r.value))
+                .unwrap_or_default();
+
+            kept.push((id, name, class));
         }
 
         // Resolve WM frames only for kept windows, and only in thumbnail mode
         // (the frame is unused for icon tiles). Batched to keep it cheap.
-        let kept_ids: Vec<Window> = kept.iter().map(|(id, _)| *id).collect();
+        let kept_ids: Vec<Window> = kept.iter().map(|(id, _, _)| *id).collect();
         let frames = if want_thumbs {
             find_frames_batched(conn, &kept_ids, root)
         } else {
             kept_ids
         };
 
-        for ((id, name), frame) in kept.into_iter().zip(frames) {
-            self.windows.push(WindowEntry { id, name, icon: None, frame });
+        for ((id, name, class), frame) in kept.into_iter().zip(frames) {
+            self.windows.push(WindowEntry { id, name, class, icon: None, frame });
         }
         Ok(())
     }
@@ -299,15 +318,19 @@ impl<'a> Switcher<'a> {
             return Ok(());
         }
 
+        // Fresh popup starts unfiltered; view = every window.
+        self.filter.clear();
+        self.rebuild_view();
+
         // Capture the monitor + grid once now, up front, so every later layout call
         // this session reuses them instead of re-querying Xinerama/pointer.
         self.cached_monitor = Some(self.query_current_monitor());
         self.cached_grid = Some(self.compute_grid_layout());
 
         if backward {
-            self.selected = self.windows.len() - 1;
+            self.selected = self.view.len() - 1;
         } else {
-            self.selected = if self.windows.len() > 1 { 1 } else { 0 };
+            self.selected = if self.view.len() > 1 { 1 } else { 0 };
         }
 
         // Register an AUTOMATIC composite redirect so NameWindowPixmap succeeds.
@@ -327,17 +350,72 @@ impl<'a> Switcher<'a> {
         // thumbnails are not loaded yet — they stream in via pump_one_enrich().
         self.redraw()?;
 
-        // Queue every window for enrichment. The selected window goes first so its
-        // icon/thumbnail appears soonest, then the rest in order.
+        // Queue every window for enrichment (by window index). The selected
+        // window goes first so its icon/thumbnail appears soonest.
         self.enrich_queue = (0..self.windows.len()).collect();
-        if self.selected != 0 {
-            if let Some(pos) = self.enrich_queue.iter().position(|&i| i == self.selected) {
+        let sel_win = self.view[self.selected];
+        if sel_win != 0 {
+            if let Some(pos) = self.enrich_queue.iter().position(|&i| i == sel_win) {
                 let sel = self.enrich_queue.remove(pos).unwrap();
                 self.enrich_queue.push_front(sel);
             }
         }
 
         Ok(())
+    }
+
+    /// Rebuild `view` (the visible window indices) from the current `filter`.
+    /// Empty filter shows every window; otherwise a case-insensitive substring
+    /// match against each window's title and `WM_CLASS`.
+    fn rebuild_view(&mut self) {
+        if self.filter.is_empty() {
+            self.view = (0..self.windows.len()).collect();
+            return;
+        }
+        let f = self.filter.as_str(); // already lowercased as typed
+        self.view = self.windows.iter().enumerate()
+            .filter(|(_, e)| {
+                e.name.to_lowercase().contains(f) || e.class.to_lowercase().contains(f)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// Append a character to the filter and re-filter — but only if at least one
+    /// window still matches. Keystrokes that would empty the list are ignored, so
+    /// the popup never collapses to nothing. Returns true if the filter changed.
+    pub fn push_filter(&mut self, ch: char) -> Result<(), Box<dyn Error>> {
+        if self.popup.is_none() { return Ok(()); }
+        let mut candidate = self.filter.clone();
+        candidate.extend(ch.to_lowercase());
+        let saved = std::mem::replace(&mut self.filter, candidate);
+        self.rebuild_view();
+        if self.view.is_empty() {
+            // Over-filtered: revert this keystroke.
+            self.filter = saved;
+            self.rebuild_view();
+            return Ok(());
+        }
+        self.after_filter_change()
+    }
+
+    /// Delete the last character of the filter and re-filter. No-op on empty filter.
+    pub fn pop_filter(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.popup.is_none() || self.filter.is_empty() { return Ok(()); }
+        self.filter.pop();
+        self.rebuild_view();
+        self.after_filter_change()
+    }
+
+    /// Clamp the selection into the new view and relayout after a filter change.
+    fn after_filter_change(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.selected >= self.view.len() {
+            self.selected = self.view.len().saturating_sub(1);
+        }
+        if self.debug {
+            eprintln!("[hop] filter=\"{}\" → {} match(es)", self.filter, self.view.len());
+        }
+        self.relayout()
     }
 
     /// Monitor the popup is laid out on. Returns the value cached at show() time;
@@ -370,7 +448,7 @@ impl<'a> Switcher<'a> {
     /// Compute how many columns (and resulting rows) fit without the popup
     /// getting within SCREEN_MARGIN pixels of the monitor edges.
     fn compute_grid_layout(&self) -> (usize, usize) {
-        let n = self.windows.len();
+        let n = self.view.len();
         if n == 0 { return (1, 0); }
         let tw  = self.tile_w();
         let fw  = self.frame_w();
@@ -401,7 +479,7 @@ impl<'a> Switcher<'a> {
 
         // If the last row is not full, offset tiles according to last_row_position.
         let x_extra: u32 = {
-            let n = self.windows.len();
+            let n = self.view.len();
             let n_rows = n.div_ceil(nc);
             let last_row = n_rows.saturating_sub(1);
             if row as usize == last_row {
@@ -512,8 +590,8 @@ impl<'a> Switcher<'a> {
             let (n_cols, _) = self.grid_layout();
             let tw = self.tile_w();
             let th = self.tile_h();
-            self.windows.iter().enumerate()
-                .map(|(i, _)| {
+            (0..self.view.len())
+                .map(|i| {
                     let (tx, ty) = self.tile_pos(i, n_cols);
                     (tx, ty, tw as u16, th as u16)
                 })
@@ -540,17 +618,24 @@ impl<'a> Switcher<'a> {
     /// Close the currently selected window via `_NET_CLOSE_WINDOW`, drop its tile
     /// from the visible set, and relayout. Hides the popup if it was the last one.
     pub fn close_selected(&mut self, root: Window) -> Result<(), Box<dyn Error>> {
-        if self.windows.is_empty() { return Ok(()); }
-        let entry = self.windows.remove(self.selected);
+        // `selected` indexes the filtered view; map it to the underlying window.
+        let win_idx = match self.view.get(self.selected) {
+            Some(&wi) => wi,
+            None => return Ok(()),
+        };
+        let entry = self.windows.remove(win_idx);
         xh::close_window(self.conn, root, entry.id)?;
         if self.debug { eprintln!("[hop] close_selected: closed {:#x}", entry.id); }
 
-        if self.windows.is_empty() {
+        // The view holds positions into `windows`; rebuilding it after the removal
+        // re-derives valid indices for the (possibly filtered) remaining set.
+        self.rebuild_view();
+        if self.view.is_empty() {
             return self.hide();
         }
         // Keep the selection in range; prefer staying at the same slot.
-        if self.selected >= self.windows.len() {
-            self.selected = self.windows.len() - 1;
+        if self.selected >= self.view.len() {
+            self.selected = self.view.len() - 1;
         }
         // Drop now-stale enrich-queue indices and re-point at the trimmed list.
         self.enrich_queue = (0..self.windows.len()).collect();
@@ -694,7 +779,8 @@ impl<'a> Switcher<'a> {
         let use_rounded = br > 0 && a8_fmt != 0;
         let ctx = PictCtx { pic: pix_pic, argb_fmt: fmt, a8_fmt, drawable: pixmap };
 
-        for (i, entry) in self.windows.iter().enumerate() {
+        for (i, &wi) in self.view.iter().enumerate() {
+            let entry = &self.windows[wi];
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
             let tile = TileGeom { x: tile_x, y: tile_y, w: tw, h: th };
             let border_argb = if i == self.selected { frame_argb } else { inact_argb };
@@ -784,7 +870,8 @@ impl<'a> Switcher<'a> {
         self.conn.flush()?;
 
         // Draw Xft text labels onto the off-screen pixmap.
-        for (i, entry) in self.windows.iter().enumerate() {
+        for (i, &wi) in self.view.iter().enumerate() {
+            let entry = &self.windows[wi];
             let (tile_x, tile_y) = self.tile_pos(i, n_cols);
             let tile = TileGeom { x: tile_x, y: tile_y, w: tw, h: th };
             self.draw_label(pixmap, entry, tile, fg_argb)?;
@@ -879,7 +966,7 @@ impl<'a> Switcher<'a> {
         let win_bg = RenderColor { red: wbr, green: wbg, blue: wbb, alpha: wba };
 
         for &(sel, border_argb) in &[(old_sel, inact_argb), (self.selected, frame_argb)] {
-            if sel >= self.windows.len() { continue; }
+            if sel >= self.view.len() { continue; }
             let (tile_x, tile_y) = self.tile_pos(sel, n_cols);
             // The four non-overlapping rectangular strips that cover the border ring area.
             let border_rects = [
@@ -1321,24 +1408,24 @@ impl<'a> Switcher<'a> {
     }
 
     pub fn next(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.windows.is_empty() { return Ok(()); }
+        if self.view.is_empty() { return Ok(()); }
         let old = self.selected;
-        self.selected = (self.selected + 1) % self.windows.len();
+        self.selected = (self.selected + 1) % self.view.len();
         if self.debug { eprintln!("[hop] next(): {old} → {}", self.selected); }
         self.border_redraw(old)
     }
 
     pub fn prev(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.windows.is_empty() { return Ok(()); }
+        if self.view.is_empty() { return Ok(()); }
         let old = self.selected;
-        self.selected = self.selected.checked_sub(1).unwrap_or(self.windows.len() - 1);
+        self.selected = self.selected.checked_sub(1).unwrap_or(self.view.len() - 1);
         if self.debug { eprintln!("[hop] prev(): {old} → {}", self.selected); }
         self.border_redraw(old)
     }
 
     /// Hide popup and switch to the selected window.
     pub fn commit(&mut self, root: Window) -> Result<(), Box<dyn Error>> {
-        let target = self.windows.get(self.selected).map(|e| e.id);
+        let target = self.view.get(self.selected).map(|&wi| self.windows[wi].id);
         self.hide()?;
         if let Some(win) = target {
             xh::activate_window(self.conn, root, win)?;
@@ -1380,15 +1467,17 @@ impl<'a> Switcher<'a> {
         self.enrich_queue.clear();
         self.cached_monitor = None;
         self.cached_grid = None;
+        self.filter.clear();
+        self.view.clear();
         Ok(())
     }
 
-    /// Return the tile index whose content rect contains popup-relative point (px, py).
+    /// Return the visible tile index whose content rect contains popup-relative (px, py).
     fn tile_at(&self, px: i16, py: i16) -> Option<usize> {
         let (n_cols, _) = self.grid_layout();
         let tw = self.tile_w() as i16;
         let th = self.tile_h() as i16;
-        for (i, _) in self.windows.iter().enumerate() {
+        for i in 0..self.view.len() {
             let (tx, ty) = self.tile_pos(i, n_cols);
             if px >= tx && px < tx + tw && py >= ty && py < ty + th {
                 return Some(i);

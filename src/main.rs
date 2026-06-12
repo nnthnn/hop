@@ -13,6 +13,8 @@ use switcher::Switcher;
 
 // Return/Enter always commits, regardless of binding config.
 const XK_RETURN: u32 = 0xff0d;
+// Backspace deletes the last character of the type-to-filter query.
+const XK_BACKSPACE: u32 = 0xff08;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let debug = std::env::var("HOP_DEBUG").is_ok();
@@ -108,6 +110,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     switcher.close_selected(root)?;
                 } else if sym == XK_RETURN && switcher.is_visible() {
                     switcher.commit(root)?;
+                } else if sym == XK_BACKSPACE && switcher.is_visible() {
+                    switcher.pop_filter()?;
+                } else if switcher.is_visible() && (0x20..=0x7e).contains(&sym) {
+                    // Any other printable key (incl. space) is type-to-filter input.
+                    // Navigation/control keys live in the 0xff00 range, so they're
+                    // already handled above and never reach here.
+                    if let Some(c) = char::from_u32(sym) {
+                        switcher.push_filter(c)?;
+                    }
                 }
             }
 

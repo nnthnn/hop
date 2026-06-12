@@ -13,8 +13,14 @@ transparency, live window thumbnails, and compositor blur support.
 - **Compositor blur** via the `_KDE_NET_WM_BLUR_BEHIND_REGION` hint (whole popup or
   per-tile) — honored by picom, KWin, and other compositors
 - **Styling** — rounded corners, configurable borders, gradients, drop shadows
+- **Type-to-filter** — start typing while the popup is open to narrow the list by
+  window title or `WM_CLASS` (case-insensitive); Backspace deletes, and the grid
+  resizes to fit. Keystrokes that would match nothing are ignored.
+- **Close windows** — the close key (default `Delete`) or a middle-click on a tile
+  closes that window via `_NET_CLOSE_WINDOW` without leaving the switcher
+- **Mouse support** — hover to select, click to activate, scroll to cycle
 - **Multi-monitor** — the popup centers on the monitor under the pointer
-- **Configurable keybindings** — modifier, next, prev, and cancel keys via TOML
+- **Configurable keybindings** — modifier, next, prev, cancel, and close keys via TOML
 - **Fast** — the popup paints immediately; icons and thumbnails stream in
   progressively without blocking input
 - Pure-Rust X11 via `x11rb` (Xft text is the only C dependency)
